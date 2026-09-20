@@ -8,8 +8,7 @@ import {
   useState,
 } from "react";
 import {
-  FIRST_PLAYLIST,
-  SEGMENTS,
+  FALLBACK_SECTIONS,
   SEGMENT_LABELS,
   STORAGE_FAVS,
   STORAGE_TITLES,
@@ -19,62 +18,33 @@ import {
 } from "@/lib/mehfil";
 
 /* ================================================================
-   YouTube IFrame API types
+   Types
    ================================================================ */
 
-declare global {
-  interface Window {
-    onYouTubeIframeAPIReady: () => void;
-    YT: {
-      Player: new (
-        el: string | HTMLElement,
-        config: Record<string, unknown>
-      ) => YTPlayerInstance;
-      PlayerState: {
-        UNSTARTED: -1;
-        ENDED: 0;
-        PLAYING: 1;
-        PAUSED: 2;
-        BUFFERING: 3;
-        CUED: 5;
-      };
-    };
-  }
+interface Track {
+  index: number;
+  id: string;
+  title: string;
+  artist: string;
+  rawTitle: string;
+  thumbnail: string;
+  duration: string;
+  source: number;
 }
 
-interface YTPlayerInstance {
-  playVideo: () => void;
-  pauseVideo: () => void;
-  nextVideo: () => void;
-  previousVideo: () => void;
-  playVideoAt: (index: number) => void;
-  seekTo: (seconds: number, allowAhead: boolean) => void;
-  setVolume: (vol: number) => void;
-  getVolume: () => number;
-  mute: () => void;
-  unMute: () => void;
-  isMuted: () => boolean;
-  getPlayerState: () => number;
-  getCurrentTime: () => number;
-  getDuration: () => number;
-  getVideoData: () => {
-    title: string;
-    author: string;
-    video_id: string;
-  };
-  getPlaylist: () => string[] | undefined;
-  getPlaylistIndex: () => number;
-  cuePlaylist: (config: {
-    playlist: string[];
-    index?: number;
-    startSeconds?: number;
-  }) => void;
-  destroy: () => void;
+interface Section {
+  label: string;
+  count: number;
 }
 
 /* ================================================================
    Helpers
    ================================================================ */
+
+const YT_ORIGINS = new Set([
+  "https://www.youtube.com",
+  "https://www.youtube-nocookie.com",
+]);
 
 function formatTime(sec: number): string {
   if (!sec || !isFinite(sec) || isNaN(sec)) return "0:00";
@@ -83,72 +53,11 @@ function formatTime(sec: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-/**
- * Captures a playlist's video IDs with a TEMPORARY player.
- * Uses a real-sized (320x180) offscreen holder — a 1x1 player does not
- * reliably initialize in browsers, so real dimensions matter.
- */
-function capturePlaylistIds(listId: string, timeoutMs = 8000): Promise<string[]> {
-  return new Promise((resolve) => {
-    let settled = false;
-    let temp: YTPlayerInstance | null = null;
-
-    const holder = document.createElement("div");
-    holder.setAttribute("aria-hidden", "true");
-    holder.style.cssText =
-      "position:fixed;top:-2000px;left:0;width:320px;height:180px;visibility:hidden;pointer-events:none;";
-    document.body.appendChild(holder);
-
-    const finish = (ids: string[]) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      try {
-        temp?.destroy();
-      } catch {
-        /* ignore */
-      }
-      holder.remove();
-      resolve(ids);
-    };
-
-    const timer = setTimeout(() => finish([]), timeoutMs);
-
-    try {
-      temp = new window.YT.Player(holder, {
-        width: 320,
-        height: 180,
-        playerVars: {
-          listType: "playlist",
-          list: listId,
-          autoplay: 0,
-          controls: 0,
-          modestbranding: 1,
-        },
-        events: {
-          onReady: () => {
-            try {
-              const ids = temp?.getPlaylist?.() ?? [];
-              finish(Array.isArray(ids) ? ids : []);
-            } catch {
-              finish([]);
-            }
-          },
-          onError: () => finish([]),
-        },
-      });
-    } catch {
-      finish([]);
-    }
-  });
-}
-
 function parseTitle(raw: string): { title: string; artist: string } {
   const cleaned = raw
     .replace(/\s*[\(\[]?(Official|Lyric|Full|HD|4K|Video|Audio|Live).*$/i, "")
     .replace(/\s{2,}/g, " ")
     .trim();
-
   const parts = cleaned.split(/\s[-–—|]\s/);
   if (parts.length >= 2) {
     return {
@@ -157,6 +66,12 @@ function parseTitle(raw: string): { title: string; artist: string } {
     };
   }
   return { title: cleaned || raw, artist: "" };
+}
+
+function embedUrl(id: string, autoplay: boolean): string {
+  return `https://www.youtube.com/embed/${id}?enablejsapi=1&autoplay=${
+    autoplay ? 1 : 0
+  }&rel=0&modestbranding=1&playsinline=1`;
 }
 
 /* ================================================================
@@ -275,75 +190,47 @@ export default function MehfilApp() {
   const [isReady, setIsReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(false);
   const [currentIndex, setCurrentIndex] = useState(0);
-  const [currentTitle, setCurrentTitle] = useState("");
-  const [currentArtist, setCurrentArtist] = useState("");
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const [volume, setVolume] = useState(80);
+  const [volume, setVolume] = useState(100);
   const [isMuted, setIsMuted] = useState(false);
-  const [playerMode, setPlayerMode] = useState<"api" | "embed">("api");
 
-  const [videoIds, setVideoIds] = useState<string[]>([]);
+  const [tracks, setTracks] = useState<Track[]>([]);
+  const [sections, setSections] = useState<Section[]>([]);
   const [boundaries, setBoundaries] = useState<number[]>([0]);
-  const [merging, setMerging] = useState(false);
-  const [duplicatesRemoved, setDuplicatesRemoved] = useState(0);
-  const [trackTitles, setTrackTitles] = useState<Record<string, string>>({});
+  const [loadingList, setLoadingList] = useState(true);
   const [titlesLoading, setTitlesLoading] = useState(false);
+  const [duplicatesRemoved, setDuplicatesRemoved] = useState(0);
+
   const [favorites, setFavorites] = useState<Set<number>>(new Set());
+  const [trackTitles, setTrackTitles] = useState<Record<string, string>>({});
   const [searchQuery, setSearchQuery] = useState("");
   const [showFavorites, setShowFavorites] = useState(false);
-  const [error, setError] = useState<string | null>(null);
 
-  const playerRef = useRef<YTPlayerInstance | null>(null);
-  const playerInitRef = useRef(false);
-  const readyRef = useRef(false);
-  const modeRef = useRef<"api" | "embed">("api");
-  const skipGuardRef = useRef(0);
+  const iframeRef = useRef<HTMLIFrameElement | null>(null);
+  const currentIndexRef = useRef(0);
+  const tracksRef = useRef<Track[]>([]);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const skipGuardRef = useRef(0);
   const trackItemRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const archiveRef = useRef<HTMLElement | null>(null);
-  const embedIframeRef = useRef<HTMLIFrameElement | null>(null);
 
-  modeRef.current = playerMode;
+  currentIndexRef.current = currentIndex;
+  tracksRef.current = tracks;
 
-  /* ── Derived ────────────────────────────────────────── */
+  /* ── Derived ───────────────────────────────────────── */
 
-  const sourceOf = useCallback(
-    (i: number) => {
-      let s = 0;
-      for (let b = 0; b < boundaries.length; b++) {
-        if (i >= boundaries[b]) s = b;
-      }
-      return s;
-    },
-    [boundaries]
-  );
-
-  const tracks = useMemo(
-    () =>
-      videoIds.map((id, i) => {
-        const raw = trackTitles[id] || "";
-        const parsed = raw
-          ? parseTitle(raw)
-          : { title: `Piece ${formatIndex(i + 1)}`, artist: "" };
-        return {
-          id,
-          index: i,
-          title: parsed.title,
-          artist: parsed.artist || currentArtist || "Qawwali archive",
-          rawTitle: raw || parsed.title,
-          thumbnail: thumbUrl(id),
-          source: boundaries.length > 1 ? sourceOf(i) : 0,
-        };
-      }),
-    [videoIds, trackTitles, boundaries, sourceOf, currentArtist]
-  );
+  const current = tracks[currentIndex];
+  const currentId = current?.id ?? "";
+  const displayTitle = current?.title ?? "Preparing the mehfil…";
+  const displayArtist =
+    current?.artist || "The Sufi Listening Room";
 
   const filteredTracks = useMemo(() => {
     let list = tracks;
-    if (showFavorites) list = list.filter((t) => favorites.has(t.index));
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
+    if (showFavorites) list = list.filter((t) => favorites.has(t.index ?? -1));
+    const q = searchQuery.trim().toLowerCase();
+    if (q) {
       list = list.filter(
         (t) =>
           t.title.toLowerCase().includes(q) ||
@@ -353,21 +240,6 @@ export default function MehfilApp() {
     }
     return list;
   }, [tracks, favorites, showFavorites, searchQuery]);
-
-  const current = tracks[currentIndex];
-  const currentId = videoIds[currentIndex] || "";
-  const displayTitle =
-    current?.title || currentTitle || "Preparing the mehfil…";
-  const displayArtist =
-    current?.artist || currentArtist || "The Sufi Listening Room";
-
-  const sectionCounts = useMemo(() => {
-    return SEGMENT_LABELS.map((_, i) => {
-      const start = boundaries[i] ?? 0;
-      const end = boundaries[i + 1] ?? videoIds.length;
-      return Math.max(0, end - start);
-    });
-  }, [boundaries, videoIds.length]);
 
   /* ── Persistence ────────────────────────────────────── */
 
@@ -381,7 +253,11 @@ export default function MehfilApp() {
   }, []);
 
   useEffect(() => {
-    localStorage.setItem(STORAGE_FAVS, JSON.stringify([...favorites]));
+    try {
+      localStorage.setItem(STORAGE_FAVS, JSON.stringify([...favorites]));
+    } catch {
+      /* ignore */
+    }
   }, [favorites]);
 
   useEffect(() => {
@@ -395,330 +271,189 @@ export default function MehfilApp() {
 
   useEffect(() => {
     if (Object.keys(trackTitles).length > 0) {
-      localStorage.setItem(STORAGE_TITLES, JSON.stringify(trackTitles));
-    }
-  }, [trackTitles]);
-
-  /* ── Time ticker ────────────────────────────────────── */
-
-  const startTimeUpdate = useCallback(() => {
-    if (intervalRef.current) clearInterval(intervalRef.current);
-    intervalRef.current = setInterval(() => {
-      const p = playerRef.current;
-      if (!p || modeRef.current !== "api") return;
       try {
-        setCurrentTime(p.getCurrentTime());
-        setDuration(p.getDuration());
+        localStorage.setItem(STORAGE_TITLES, JSON.stringify(trackTitles));
       } catch {
         /* ignore */
       }
-    }, 400);
-  }, []);
-
-  const stopTimeUpdate = useCallback(() => {
-    if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-      intervalRef.current = null;
     }
-  }, []);
+  }, [trackTitles]);
 
-  /* ── Mode switching ─────────────────────────────────── */
-
-  const switchToEmbed = useCallback(() => {
-    setPlayerMode("embed");
-    setIsReady(true);
-    const singles = SEGMENTS.flatMap((s) =>
-      s.type === "videos" ? s.ids : []
-    );
-    setVideoIds((prev) => (prev.length > 0 ? prev : singles));
-  }, []);
-
-  /* ── Player callbacks ───────────────────────────────── */
-
-  const updateTrackInfo = useCallback(() => {
-    const p = playerRef.current;
-    if (!p || modeRef.current !== "api") return;
-    try {
-      const data = p.getVideoData();
-      const idx = p.getPlaylistIndex();
-      if (typeof idx === "number" && idx >= 0) {
-        setCurrentIndex(idx);
-        skipGuardRef.current = 0;
-      }
-      if (data.title) {
-        const parsed = parseTitle(data.title);
-        setCurrentTitle(parsed.title);
-        setCurrentArtist(parsed.artist || data.author || "");
-        if (data.video_id) {
-          setTrackTitles((prev) => ({
-            ...prev,
-            [data.video_id]: data.title,
-          }));
-        }
-      } else if (data.author) {
-        setCurrentArtist(data.author);
-      }
-      setDuration(p.getDuration());
-      setCurrentTime(p.getCurrentTime());
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
-  const chainSegments = useCallback(
-    async (firstIds: string[]) => {
-      setMerging(true);
-      try {
-        const rest = SEGMENTS.slice(1);
-        const results = await Promise.all(
-          rest.map((seg) =>
-            seg.type === "playlist"
-              ? capturePlaylistIds(seg.id)
-              : Promise.resolve<string[]>(seg.ids)
-          )
-        );
-
-        const seen = new Set<string>();
-        let dropped = 0;
-        const dedupe = (ids: string[]) =>
-          ids.filter((id) => {
-            if (!id) return false;
-            if (seen.has(id)) {
-              dropped += 1;
-              return false;
-            }
-            seen.add(id);
-            return true;
-          });
-
-        const combined: string[] = [];
-        const starts: number[] = [];
-
-        starts.push(0);
-        combined.push(...dedupe(firstIds));
-
-        results.forEach((ids) => {
-          starts.push(combined.length);
-          combined.push(...dedupe(ids));
-        });
-
-        const p = playerRef.current;
-        if (p && combined.length > 0) {
-          try {
-            const wasPlaying = p.getPlayerState() === 1;
-            const oldIndex =
-              typeof p.getPlaylistIndex() === "number"
-                ? p.getPlaylistIndex()
-                : 0;
-            const oldId = firstIds[oldIndex];
-            const newIndex = oldId ? combined.indexOf(oldId) : -1;
-            p.cuePlaylist({
-              playlist: combined,
-              index: newIndex >= 0 ? newIndex : 0,
-              startSeconds: 0,
-            });
-            if (wasPlaying) p.playVideo();
-            updateTrackInfo();
-          } catch {
-            /* ignore */
-          }
-        }
-
-        setVideoIds(combined);
-        setBoundaries(starts);
-        setDuplicatesRemoved(dropped);
-      } finally {
-        setMerging(false);
-      }
-    },
-    [updateTrackInfo]
-  );
-
-  const onPlayerReady = useCallback(() => {
-    const p = playerRef.current;
-    if (!p) return;
-    readyRef.current = true;
-    setPlayerMode("api");
-    setIsReady(true);
-    try {
-      setVolume(p.getVolume());
-    } catch {
-      /* ignore */
-    }
-
-    const ids = p.getPlaylist();
-    if (ids && ids.length > 0) setVideoIds(ids);
-
-    updateTrackInfo();
-    void chainSegments(ids ?? []);
-  }, [updateTrackInfo, chainSegments]);
-
-  const onStateChange = useCallback(
-    (event: { data: number }) => {
-      if (!window.YT) return;
-      const S = window.YT.PlayerState;
-      switch (event.data) {
-        case S.PLAYING:
-          setIsPlaying(true);
-          skipGuardRef.current = 0;
-          startTimeUpdate();
-          updateTrackInfo();
-          break;
-        case S.PAUSED:
-          setIsPlaying(false);
-          stopTimeUpdate();
-          break;
-        case S.ENDED:
-          setIsPlaying(false);
-          stopTimeUpdate();
-          break;
-        case S.BUFFERING:
-        case S.CUED:
-          updateTrackInfo();
-          break;
-      }
-    },
-    [updateTrackInfo, startTimeUpdate, stopTimeUpdate]
-  );
-
-  /* Skip an unplayable/embed-blocked video (with a safety cap) */
-  const onPlayerError = useCallback(() => {
-    skipGuardRef.current += 1;
-    if (skipGuardRef.current > 6) {
-      setError(
-        "Several videos in this playlist block embedding. Use “Open on YouTube” on the card to listen there, or skip ahead with Next."
-      );
-      return;
-    }
-    try {
-      playerRef.current?.nextVideo();
-    } catch {
-      /* ignore */
-    }
-  }, []);
-
-  /* ── Initialize the real player ─────────────────────── */
+  /* ── Load the full queue from the server ────────────── */
 
   useEffect(() => {
-    if (playerInitRef.current) return;
-    playerInitRef.current = true;
+    let cancelled = false;
 
-    const init = () => {
+    (async () => {
       try {
-        const target = document.getElementById("yt-player-target");
-        if (!target) {
-          switchToEmbed();
-          setError("Player mount missing — switched to standard embed.");
-          return;
+        const res = await fetch("/api/playlist");
+        const data: {
+          items?: Array<{
+            id: string;
+            title: string;
+            channel: string;
+            duration: string;
+            thumbnail: string;
+            segmentIndex: number;
+            segmentLabel: string;
+          }>;
+          sections?: Section[];
+          removedDuplicates?: number;
+        } = await res.json();
+
+        if (cancelled) return;
+
+        let items = data.items ?? [];
+        if (items.length === 0) {
+          // Absolute last resort: baked-in snapshot
+          items = FALLBACK_SECTIONS.flatMap((s, i) =>
+            s.ids.map((id) => ({
+              id,
+              title: "",
+              channel: "",
+              duration: "",
+              thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+              segmentIndex: i,
+              segmentLabel: s.label,
+            }))
+          );
         }
-        playerRef.current = new window.YT.Player("yt-player-target", {
-          width: "100%",
-          height: "100%",
-          playerVars: {
-            listType: "playlist",
-            list: FIRST_PLAYLIST.id,
-            autoplay: 0,
-            controls: 0,
-            modestbranding: 1,
-            rel: 0,
-            enablejsapi: 1,
-            playsinline: 1,
-          },
-          events: {
-            onReady: onPlayerReady,
-            onStateChange: onStateChange,
-            onError: onPlayerError,
-          },
+
+        const starts: number[] = [];
+        const seenSeg = new Set<number>();
+        const mapped: Track[] = items.map((it, i) => {
+          if (!seenSeg.has(it.segmentIndex)) {
+            seenSeg.add(it.segmentIndex);
+            starts.push(i);
+          }
+          return {
+            index: i,
+            id: it.id,
+            title: it.title,
+            artist: it.channel,
+            rawTitle: it.title,
+            thumbnail: it.thumbnail,
+            duration: it.duration,
+            source: it.segmentIndex,
+          };
         });
+
+        setTracks(mapped);
+        setSections(
+          (data.sections ?? SEGMENT_LABELS.map((label, i) => ({
+            label,
+            count: mapped.filter((m) => m.source === i).length,
+          })))
+        );
+        setBoundaries(starts);
+        setDuplicatesRemoved(data.removedDuplicates ?? 0);
       } catch {
-        switchToEmbed();
-        setError("Could not start the player — switched to standard embed.");
+        if (cancelled) return;
+        // Network/scraper fully down — use the baked snapshot
+        const items = FALLBACK_SECTIONS.flatMap((s, i) =>
+          s.ids.map((id) => ({
+            id,
+            title: "",
+            channel: "",
+            duration: "",
+            thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+            segmentIndex: i,
+            segmentLabel: s.label,
+          }))
+        );
+        const starts: number[] = [];
+        const seenSeg = new Set<number>();
+        const mapped: Track[] = items.map((it, i) => {
+          if (!seenSeg.has(it.segmentIndex)) {
+            seenSeg.add(it.segmentIndex);
+            starts.push(i);
+          }
+          return {
+            index: i,
+            id: it.id,
+            title: it.title,
+            artist: it.channel,
+            rawTitle: it.title,
+            thumbnail: it.thumbnail,
+            duration: it.duration,
+            source: it.segmentIndex,
+          };
+        });
+        setTracks(mapped);
+        setSections(
+          SEGMENT_LABELS.map((label, i) => ({
+            label,
+            count: mapped.filter((m) => m.source === i).length,
+          }))
+        );
+        setBoundaries(starts);
+      } finally {
+        if (!cancelled) setLoadingList(false);
       }
-    };
-
-    if (window.YT && window.YT.Player) {
-      init();
-    } else {
-      const tag = document.createElement("script");
-      tag.src = "https://www.youtube.com/iframe_api";
-      tag.onerror = () => switchToEmbed();
-      const first = document.getElementsByTagName("script")[0];
-      first.parentNode?.insertBefore(tag, first);
-      window.onYouTubeIframeAPIReady = init;
-    }
-
-    const timeout = setTimeout(() => {
-      if (!readyRef.current) {
-        // JS API failed to start in this browser/network — fall back to
-        // a plain YouTube embed, which always works.
-        switchToEmbed();
-      }
-    }, 20_000);
+    })();
 
     return () => {
-      clearTimeout(timeout);
-      stopTimeUpdate();
+      cancelled = true;
     };
-  }, [
-    onPlayerReady,
-    onStateChange,
-    onPlayerError,
-    switchToEmbed,
-    stopTimeUpdate,
-  ]);
+  }, []);
 
-  /* ── Titles ────────────────────────────────────────── */
+  /* ── Resolve missing titles via oEmbed ──────────────── */
 
   useEffect(() => {
-    if (videoIds.length === 0) return;
-    const missing = videoIds.filter((id) => !trackTitles[id]);
+    if (tracks.length === 0) return;
+    const missing = tracks.filter((t) => !t.title && !trackTitles[t.id]);
     if (missing.length === 0) return;
 
     let cancelled = false;
+    setTitlesLoading(true);
 
-    async function fetchTitles() {
-      setTitlesLoading(true);
-      try {
-        const res = await fetch("/api/playlist-titles", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ videoIds: missing }),
-        });
+    fetch("/api/playlist-titles", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ videoIds: missing.map((m) => m.id) }),
+    })
+      .then(async (res) => {
         if (!res.ok) return;
         const data: { titles?: Record<string, string> } = await res.json();
-        if (!cancelled && data.titles) {
-          setTrackTitles((prev) => ({ ...prev, ...data.titles }));
-        }
-      } catch {
-        /* silent */
-      } finally {
+        if (!data.titles) return;
+        if (cancelled) return;
+        setTrackTitles((prev) => ({ ...prev, ...data.titles }));
+      })
+      .catch(() => undefined)
+      .finally(() => {
         if (!cancelled) setTitlesLoading(false);
-      }
-    }
+      });
 
-    fetchTitles();
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [videoIds.length]);
+  }, [tracks.length]);
 
-  /* ── Scroll active track ────────────────────────────── */
+  /* ── Apply oEmbed titles to the display list ────────── */
 
-  useEffect(() => {
-    if (view !== "archive") return;
-    const el = trackItemRefs.current.get(currentIndex);
-    if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
-  }, [currentIndex, view]);
+  const displayTracks = useMemo(() => {
+    return tracks.map((t) => {
+      const raw = trackTitles[t.id] || t.rawTitle || "";
+      if (!raw || raw === t.rawTitle) return t;
+      const parsed = parseTitle(raw);
+      return {
+        ...t,
+        title: parsed.title,
+        artist: parsed.artist || t.artist,
+        rawTitle: raw,
+      };
+    });
+  }, [tracks, trackTitles]);
 
-  /* ── Embed-mode postMessage controls ────────────────── */
+  /* ── postMessage bridge to the YouTube embed ────────── */
 
-  const embedCommand = useCallback((func: string, args?: unknown[]) => {
-    const win = embedIframeRef.current?.contentWindow;
+  const sendCmd = useCallback((func: string, args: unknown[] = []) => {
+    const win = iframeRef.current?.contentWindow;
     if (!win) return;
     try {
       win.postMessage(
-        JSON.stringify({ event: "command", func, args: args ?? [] }),
+        JSON.stringify({ event: "command", func, args }),
         "https://www.youtube.com"
       );
     } catch {
@@ -726,141 +461,192 @@ export default function MehfilApp() {
     }
   }, []);
 
-  /* ── Controls ───────────────────────────────────────── */
+  const startPolling = useCallback(() => {
+    if (intervalRef.current) clearInterval(intervalRef.current);
+    intervalRef.current = setInterval(() => {
+      sendCmd("getCurrentTime");
+      sendCmd("getDuration");
+    }, 1000);
+  }, [sendCmd]);
+
+  const stopPolling = useCallback(() => {
+    if (intervalRef.current) {
+      clearInterval(intervalRef.current);
+      intervalRef.current = null;
+    }
+  }, []);
+
+  /* ── Track switching (iframe remount = new video) ───── */
+
+  const playAt = useCallback((idx: number) => {
+    const list = tracksRef.current;
+    if (list.length === 0) return;
+    const clamped = ((idx % list.length) + list.length) % list.length;
+    skipGuardRef.current = 0;
+    setCurrentTime(0);
+    setDuration(0);
+    setCurrentIndex(clamped);
+    if (clamped === currentIndexRef.current) {
+      sendCmd("playVideo");
+    }
+    // A changed index remounts the iframe with autoplay=1
+    setIsPlaying(true);
+  }, [sendCmd]);
+
+  const advance = useCallback(() => {
+    const list = tracksRef.current;
+    if (list.length === 0) return;
+    if (currentIndexRef.current >= list.length - 1) {
+      setIsPlaying(false);
+      stopPolling();
+      return;
+    }
+    playAt(currentIndexRef.current + 1);
+  }, [playAt, stopPolling]);
+
+  /* ── Listen for player state messages ───────────────── */
+
+  useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      if (!YT_ORIGINS.has(e.origin)) return;
+      if (typeof e.data !== "string") return;
+      let data: { event?: string; info?: number | string };
+      try {
+        data = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      switch (data.event) {
+        case "onReady":
+          setIsReady(true);
+          sendCmd("getDuration");
+          break;
+        case "onStateChange": {
+          const s = Number(data.info);
+          if (s === 1) {
+            // playing
+            skipGuardRef.current = 0;
+            setIsPlaying(true);
+            startPolling();
+          } else if (s === 2) {
+            // paused
+            setIsPlaying(false);
+            stopPolling();
+          } else if (s === 0) {
+            // ended → next piece
+            setIsPlaying(false);
+            stopPolling();
+            advance();
+          }
+          break;
+        }
+        case "onCurrentTime":
+          setCurrentTime(Number(data.info) || 0);
+          break;
+        case "onDurationChange":
+          setDuration(Number(data.info) || 0);
+          break;
+        case "onError": {
+          const code = Number(data.info);
+          // 2 invalid param, 5 html5, 100 not found, 101/150 embed blocked
+          if (code === 101 || code === 150 || code === 100) {
+            skipGuardRef.current += 1;
+            if (skipGuardRef.current > 6) {
+              setIsPlaying(false);
+              stopPolling();
+              break;
+            }
+            advance();
+          }
+          break;
+        }
+      }
+    };
+    window.addEventListener("message", onMsg);
+    return () => {
+      window.removeEventListener("message", onMsg);
+      stopPolling();
+    };
+  }, [sendCmd, startPolling, stopPolling, advance]);
+
+  /* ── Scroll active track ────────────────────────────── */
+
+  useEffect(() => {
+    if (view !== "archive") return;
+    const el = trackItemRefs.current.get(currentIndex);
+    el?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  }, [currentIndex, view]);
+
+  /* ── Controls ──────────────────────────────────────── */
 
   const play = useCallback(() => {
-    if (modeRef.current === "api") {
-      try {
-        playerRef.current?.playVideo();
-      } catch {
-        /* ignore */
-      }
-    } else if (currentId) {
-      embedCommand("playVideo");
-    }
+    if (!currentId) return;
+    sendCmd("playVideo");
     setIsPlaying(true);
-  }, [currentId, embedCommand]);
+  }, [currentId, sendCmd]);
 
   const pause = useCallback(() => {
-    if (modeRef.current === "api") {
-      try {
-        playerRef.current?.pauseVideo();
-      } catch {
-        /* ignore */
-      }
-    } else {
-      embedCommand("pauseVideo");
-    }
+    sendCmd("pauseVideo");
     setIsPlaying(false);
-  }, [embedCommand]);
+  }, [sendCmd]);
 
   const togglePlay = useCallback(() => {
     if (isPlaying) pause();
     else play();
   }, [isPlaying, play, pause]);
 
-  const playAt = useCallback(
-    (idx: number) => {
-      setCurrentIndex(idx);
-      skipGuardRef.current = 0;
-      if (modeRef.current === "api") {
-        try {
-          playerRef.current?.playVideoAt(idx);
-        } catch {
-          /* ignore */
-        }
-      }
-      // Embed mode: the iframe src is keyed by currentIndex, so the new
-      // video loads with autoplay=1 automatically.
-      setIsPlaying(true);
-    },
-    []
-  );
-
   const next = useCallback(() => {
-    if (modeRef.current === "api" && videoIds.length > 0) {
-      try {
-        playerRef.current?.nextVideo();
-        return;
-      } catch {
-        /* fall through */
-      }
-    }
-    if (videoIds.length === 0) return;
-    playAt((currentIndex + 1) % videoIds.length);
-  }, [videoIds.length, currentIndex, playAt]);
+    if (tracks.length === 0) return;
+    playAt(currentIndexRef.current + 1);
+  }, [tracks.length, playAt]);
 
   const prev = useCallback(() => {
-    if (modeRef.current === "api" && videoIds.length > 0) {
-      try {
-        playerRef.current?.previousVideo();
-        return;
-      } catch {
-        /* fall through */
-      }
-    }
-    if (videoIds.length === 0) return;
-    playAt((currentIndex - 1 + videoIds.length) % videoIds.length);
-  }, [videoIds.length, currentIndex, playAt]);
+    if (tracks.length === 0) return;
+    playAt(currentIndexRef.current - 1);
+  }, [tracks.length, playAt]);
 
   const handleSeek = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
-      const p = playerRef.current;
-      if (!p || !duration || modeRef.current !== "api") return;
+      if (!duration) return;
       const rect = e.currentTarget.getBoundingClientRect();
       const pct = Math.max(
         0,
         Math.min(1, (e.clientX - rect.left) / rect.width)
       );
-      try {
-        p.seekTo(pct * duration, true);
-        setCurrentTime(pct * duration);
-      } catch {
-        /* ignore */
-      }
+      const t = pct * duration;
+      sendCmd("seekTo", [t, true]);
+      setCurrentTime(t);
     },
-    [duration]
+    [duration, sendCmd]
   );
 
   const handleVolume = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
-      const p = playerRef.current;
-      if (!p || modeRef.current !== "api") return;
       const rect = e.currentTarget.getBoundingClientRect();
       const pct = Math.max(
         0,
         Math.min(1, (e.clientX - rect.left) / rect.width)
       );
       const vol = Math.round(pct * 100);
-      try {
-        p.setVolume(vol);
-        setVolume(vol);
-        if (vol > 0 && isMuted) {
-          p.unMute();
-          setIsMuted(false);
-        }
-      } catch {
-        /* ignore */
+      sendCmd("setVolume", [vol]);
+      setVolume(vol);
+      if (vol > 0 && isMuted) {
+        sendCmd("unMute");
+        setIsMuted(false);
       }
     },
-    [isMuted]
+    [isMuted, sendCmd]
   );
 
   const toggleMute = useCallback(() => {
-    const p = playerRef.current;
-    if (!p || modeRef.current !== "api") return;
-    try {
-      if (isMuted) {
-        p.unMute();
-        setIsMuted(false);
-      } else {
-        p.mute();
-        setIsMuted(true);
-      }
-    } catch {
-      /* ignore */
+    if (isMuted) {
+      sendCmd("unMute");
+      setIsMuted(false);
+    } else {
+      sendCmd("mute");
+      setIsMuted(true);
     }
-  }, [isMuted]);
+  }, [isMuted, sendCmd]);
 
   const toggleFavorite = useCallback((idx: number) => {
     setFavorites((prev) => {
@@ -880,9 +666,9 @@ export default function MehfilApp() {
           block: "start",
         });
       });
-      if (startPlaying && isReady) play();
+      if (startPlaying) play();
     },
-    [isReady, play]
+    [play]
   );
 
   /* ── Keyboard ──────────────────────────────────────── */
@@ -916,14 +702,15 @@ export default function MehfilApp() {
     return () => window.removeEventListener("keydown", handler);
   }, [view, enterArchive, togglePlay, next, prev, toggleMute]);
 
-  const showBar = isReady;
-
   /* ================================================================
      RENDER
      ================================================================ */
 
+  const sectionLabels =
+    sections.length > 0 ? sections.map((s) => s.label) : SEGMENT_LABELS;
+
   return (
-    <div className={`mehfil-stage ${showBar ? "has-player-bar" : ""}`}>
+    <div className={`mehfil-stage ${isReady ? "has-player-bar" : ""}`}>
       {/* ════════════════════════════════════════════════
           LANDING
           ════════════════════════════════════════════════ */}
@@ -1027,11 +814,8 @@ export default function MehfilApp() {
       )}
 
       {/* ════════════════════════════════════════════════
-          ARCHIVE
+          ARCHIVE (always mounted — holds the live player)
           ════════════════════════════════════════════════ */}
-      {/* The archive (and its player) is ALWAYS mounted. On the landing
-          page it is parked offscreen at full real dimensions so the
-          player engine never unmounts or degrades to a 1x1 box. */}
       <section
         ref={archiveRef}
         className={
@@ -1040,38 +824,38 @@ export default function MehfilApp() {
             : "min-h-screen flex flex-col archive-hidden"
         }
       >
-          <header className="sticky top-0 z-40 border-b border-[color:var(--color-line)] bg-[rgba(7,6,5,0.72)] backdrop-blur-xl">
-            <div className="max-w-7xl mx-auto px-5 sm:px-8 h-14 flex items-center justify-between gap-4">
-              <button
-                onClick={() => setView("landing")}
-                className="eyebrow hover:text-[color:var(--color-gold-soft)] transition-colors"
-              >
-                ← The Archive
-              </button>
+        <header className="sticky top-0 z-40 border-b border-[color:var(--color-line)] bg-[rgba(7,6,5,0.72)] backdrop-blur-xl">
+          <div className="max-w-7xl mx-auto px-5 sm:px-8 h-14 flex items-center justify-between gap-4">
+            <button
+              onClick={() => setView("landing")}
+              className="eyebrow hover:text-[color:var(--color-gold-soft)] transition-colors"
+            >
+              ← The Archive
+            </button>
 
-              <div className="flex items-center gap-3 sm:gap-4">
-                <button
-                  onClick={() => setShowFavorites((v) => !v)}
-                  className={`p-2 rounded-full transition-colors ${
-                    showFavorites
-                      ? "text-[color:var(--color-gold)]"
-                      : "text-[color:var(--color-muted)] hover:text-[color:var(--color-gold)]"
-                  }`}
-                  aria-label="Favorites"
-                >
-                  <IconHeart filled={showFavorites} />
-                </button>
-                <div className="hidden sm:flex items-center gap-2 border-b border-[color:var(--color-line)] pb-1 min-w-[200px]">
-                  <IconSearch />
-                  <input
-                    value={searchQuery}
-                    onChange={(e) => setSearchQuery(e.target.value)}
-                    placeholder="Search the mehfil…"
-                    className="bg-transparent border-0 outline-none text-sm w-full placeholder:text-[color:var(--color-muted-dim)]"
-                  />
-                </div>
+            <div className="flex items-center gap-3 sm:gap-4">
+              <button
+                onClick={() => setShowFavorites((v) => !v)}
+                className={`p-2 rounded-full transition-colors ${
+                  showFavorites
+                    ? "text-[color:var(--color-gold)]"
+                    : "text-[color:var(--color-muted)] hover:text-[color:var(--color-gold)]"
+                }`}
+                aria-label="Favorites"
+              >
+                <IconHeart filled={showFavorites} />
+              </button>
+              <div className="hidden sm:flex items-center gap-2 border-b border-[color:var(--color-line)] pb-1 min-w-[200px]">
+                <IconSearch />
+                <input
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search the mehfil…"
+                  className="bg-transparent border-0 outline-none text-sm w-full placeholder:text-[color:var(--color-muted-dim)]"
+                />
               </div>
             </div>
+          </div>
           </header>
 
           <main className="flex-1 max-w-7xl mx-auto w-full px-5 sm:px-8 py-10 sm:py-12">
@@ -1081,8 +865,8 @@ export default function MehfilApp() {
                 Qawwali, <em className="gold">kept close.</em>
               </h2>
               <p className="mt-4 text-[color:var(--color-cream-dim)] leading-relaxed">
-                A hand-curated listening shelf. Every piece plays right here —
-                the transport bar at the bottom controls everything.
+                A hand-curated listening shelf. Every playable entry opens
+                through the official YouTube embed.
               </p>
             </div>
 
@@ -1100,28 +884,14 @@ export default function MehfilApp() {
               {/* Track list */}
               <div className="glass overflow-hidden">
                 <div className="max-h-[min(70vh,760px)] overflow-y-auto">
-                  {!isReady && !error && (
+                  {loadingList && (
                     <div className="py-20 text-center text-[color:var(--color-muted)]">
                       <div className="w-8 h-8 border border-[color:var(--color-gold)] border-t-transparent rounded-full spin mx-auto mb-4" />
                       <p className="text-sm">Opening the archive…</p>
                     </div>
                   )}
 
-                  {error && (
-                    <div className="py-12 px-6 text-center">
-                      <p className="text-sm text-[color:var(--color-cream-dim)] mb-4">
-                        {error}
-                      </p>
-                      <button
-                        className="btn btn-gold"
-                        onClick={() => window.location.reload()}
-                      >
-                        Try again
-                      </button>
-                    </div>
-                  )}
-
-                  {isReady && filteredTracks.length === 0 && !error && (
+                  {!loadingList && filteredTracks.length === 0 && (
                     <div className="py-20 text-center text-[color:var(--color-muted)]">
                       {showFavorites ? (
                         <>
@@ -1137,94 +907,101 @@ export default function MehfilApp() {
                     </div>
                   )}
 
-                  {filteredTracks.map((track, pos) => {
-                    const isActive = track.index === currentIndex;
-                    const prevTrack = pos > 0 ? filteredTracks[pos - 1] : null;
-                    const startsNew =
-                      boundaries.length > 1 &&
-                      (prevTrack === null ||
-                        prevTrack.source !== track.source);
-                    const count = sectionCounts[track.source] ?? 0;
+                  {!loadingList &&
+                    filteredTracks.map((track, pos) => {
+                      const activeTrack = displayTracks[track.index];
+                      const isActive = track.index === currentIndex;
+                      const prevTrack =
+                        pos > 0 ? filteredTracks[pos - 1] : null;
+                      const startsNew =
+                        boundaries.length > 1 &&
+                        (prevTrack === null ||
+                          prevTrack.source !== track.source);
+                      const count =
+                        sections[track.source]?.count ?? 0;
 
-                    return (
-                      <div key={`${track.id}-${track.index}`}>
-                        {startsNew && count > 0 && (
-                          <div className="section-label">
-                            <span>
-                              {SEGMENT_LABELS[track.source] ??
-                                `Section ${track.source + 1}`}
-                            </span>
-                            <span className="rule" />
-                            <span className="count">{count} pieces</span>
-                          </div>
-                        )}
+                      return (
+                        <div key={`${track.id}-${track.index}`}>
+                          {startsNew && count > 0 && (
+                            <div className="section-label">
+                              <span>
+                                {sectionLabels[track.source] ??
+                                  `Section ${track.source + 1}`}
+                              </span>
+                              <span className="rule" />
+                              <span className="count">{count} pieces</span>
+                            </div>
+                          )}
 
-                        <div
-                          ref={(el) => {
-                            if (el)
-                              trackItemRefs.current.set(track.index, el);
-                            else trackItemRefs.current.delete(track.index);
-                          }}
-                          className={`track-row ${isActive ? "is-active" : ""}`}
-                          onClick={() => playAt(track.index)}
-                        >
-                          <span className="num">
-                            {formatIndex(track.index + 1)}
-                          </span>
-
-                          <div className="w-12 h-9 rounded-[2px] overflow-hidden bg-black/40 shrink-0">
-                            {/* eslint-disable-next-line @next/next/no-img-element */}
-                            <img
-                              src={track.thumbnail}
-                              alt=""
-                              className="w-full h-full object-cover opacity-90"
-                              loading="lazy"
-                            />
-                          </div>
-
-                          <div className="min-w-0">
-                            <p className="meta-title truncate">
-                              {track.title}
-                            </p>
-                            <p className="meta-sub truncate">{track.artist}</p>
-                          </div>
-
-                          <span className="action hidden sm:inline">
-                            {isActive
-                              ? isPlaying
-                                ? "Playing"
-                                : "Selected"
-                              : "Listen"}
-                          </span>
-
-                          <button
-                            onClick={(e) => {
-                              e.stopPropagation();
-                              toggleFavorite(track.index);
+                          <div
+                            ref={(el) => {
+                              if (el)
+                                trackItemRefs.current.set(track.index, el);
+                              else trackItemRefs.current.delete(track.index);
                             }}
-                            className={`p-1.5 transition-colors ${
-                              favorites.has(track.index)
-                                ? "text-[color:var(--color-gold)]"
-                                : "text-[color:var(--color-muted-dim)] hover:text-[color:var(--color-gold)]"
+                            className={`track-row ${
+                              isActive ? "is-active" : ""
                             }`}
-                            aria-label={
-                              favorites.has(track.index)
-                                ? "Remove favorite"
-                                : "Save favorite"
-                            }
+                            onClick={() => playAt(track.index)}
                           >
-                            <IconHeart filled={favorites.has(track.index)} />
-                          </button>
+                            <span className="num">
+                              {formatIndex(track.index + 1)}
+                            </span>
+
+                            <div className="w-12 h-9 rounded-[2px] overflow-hidden bg-black/40 shrink-0">
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img
+                                src={track.thumbnail}
+                                alt=""
+                                className="w-full h-full object-cover opacity-90"
+                                loading="lazy"
+                              />
+                            </div>
+
+                            <div className="min-w-0">
+                              <p className="meta-title truncate">
+                                {activeTrack?.title ||
+                                  `Piece ${formatIndex(track.index + 1)}`}
+                              </p>
+                              <p className="meta-sub truncate">
+                                {activeTrack?.artist ||
+                                  track.artist ||
+                                  "Qawwali archive"}
+                              </p>
+                            </div>
+
+                            <span className="action hidden sm:inline">
+                              {isActive
+                                ? isPlaying
+                                  ? "Playing"
+                                  : "Selected"
+                                : "Listen"}
+                            </span>
+
+                            <button
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                toggleFavorite(track.index);
+                              }}
+                              className={`p-1.5 transition-colors ${
+                                favorites.has(track.index)
+                                  ? "text-[color:var(--color-gold)]"
+                                  : "text-[color:var(--color-muted-dim)] hover:text-[color:var(--color-gold)]"
+                              }`}
+                              aria-label="Favorite"
+                            >
+                              <IconHeart filled={favorites.has(track.index)} />
+                            </button>
+                          </div>
                         </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })}
                 </div>
 
                 <div className="border-t border-[color:var(--color-line)] px-4 py-3 flex flex-wrap items-center gap-x-5 gap-y-1 text-[0.7rem] tracking-[0.14em] uppercase text-[color:var(--color-muted)]">
                   <span>
                     <span className="text-[color:var(--color-gold)] font-serif normal-case tracking-normal text-base mr-1.5">
-                      {videoIds.length || "—"}
+                      {tracks.length || "—"}
                     </span>
                     Playable pieces
                   </span>
@@ -1239,16 +1016,16 @@ export default function MehfilApp() {
                       {duplicatesRemoved} duplicates removed
                     </span>
                   )}
-                  {(merging || titlesLoading) && (
+                  {titlesLoading && (
                     <span className="flex items-center gap-2 normal-case tracking-normal text-[color:var(--color-gold)]">
                       <span className="w-2.5 h-2.5 border border-current border-t-transparent rounded-full spin" />
-                      {merging ? "Merging sections…" : "Loading titles…"}
+                      Loading titles…
                     </span>
                   )}
                 </div>
               </div>
 
-              {/* Now playing — real visible player */}
+              {/* Now playing — official YouTube embed */}
               <aside className="lg:sticky lg:top-20">
                 <div className="player-card overflow-hidden">
                   <div className="flex items-center justify-between px-4 py-3 border-b border-[color:var(--color-line)]">
@@ -1261,45 +1038,26 @@ export default function MehfilApp() {
                       Now in the mehfil
                     </span>
                     <span className="text-[0.68rem] tracking-[0.18em] uppercase text-[color:var(--color-muted)]">
-                      {isReady
-                        ? isPlaying
-                          ? "Playing"
-                          : "Ready"
-                        : "Loading"}
-                      {playerMode === "embed" && (
-                        <span className="ml-2 opacity-60">· embed</span>
-                      )}
+                      {isPlaying ? "Playing" : "Ready"}
                     </span>
                   </div>
 
-                  {/* The real player. In API mode the JS API replaces
-                      #yt-player-target with a live 16:9 YouTube iframe.
-                      It is ALWAYS mounted (even on the landing page,
-                      parked offscreen at full size) so playback never
-                      loses its engine. */}
-                  {playerMode === "api" ? (
-                    <div className="player-slot">
-                      <div id="yt-player-target" className="w-full h-full" />
-                    </div>
-                  ) : (
-                    <div className="player-slot">
-                      {currentId ? (
-                        <iframe
-                          key={`${currentId}-${currentIndex}`}
-                          ref={embedIframeRef}
-                          className="player-slot-iframe"
-                          src={`https://www.youtube.com/embed/${currentId}?autoplay=${isPlaying ? 1 : 0}&rel=0&modestbranding=1&playsinline=1`}
-                          title={displayTitle}
-                          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
-                          allowFullScreen
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center text-[color:var(--color-muted)]">
-                          <div className="w-8 h-8 border border-[color:var(--color-gold)] border-t-transparent rounded-full spin" />
-                        </div>
-                      )}
-                    </div>
-                  )}
+                  <div className="player-slot">
+                    {currentId ? (
+                      <iframe
+                        key={`${currentId}-${currentIndex}`}
+                        ref={iframeRef}
+                        src={embedUrl(currentId, true)}
+                        title={displayTitle}
+                        allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                        allowFullScreen
+                      />
+                    ) : (
+                      <div className="w-full h-full flex items-center justify-center text-[color:var(--color-muted)]">
+                        <div className="w-8 h-8 border border-[color:var(--color-gold)] border-t-transparent rounded-full spin" />
+                      </div>
+                    )}
+                  </div>
 
                   <div className="p-5 sm:p-6">
                     <p className="text-[0.68rem] tracking-[0.2em] uppercase text-[color:var(--color-gold)] mb-2">
@@ -1309,9 +1067,9 @@ export default function MehfilApp() {
                       {displayTitle}
                     </h3>
                     <p className="mt-3 text-sm text-[color:var(--color-muted)] leading-relaxed">
-                      Playback runs here with no ads cluttering the room. Use
-                      the bar at the bottom for play, pause, previous and
-                      next.
+                      Press play inside the YouTube player, or use the bar at
+                      the bottom. The original YouTube controls remain
+                      available so playback stays reliable and familiar.
                     </p>
 
                     <div className="mt-5 flex flex-wrap gap-2.5">
@@ -1336,13 +1094,16 @@ export default function MehfilApp() {
                       )}
                     </div>
 
-                    {videoIds.length > 0 && (
+                    {tracks.length > 0 && (
                       <p className="mt-5 text-[0.75rem] text-[color:var(--color-muted-dim)]">
-                        Piece {currentIndex + 1} of {videoIds.length}
+                        Piece {currentIndex + 1} of {tracks.length}
                         {boundaries.length > 1 && (
                           <>
                             {" "}
-                            · {SEGMENT_LABELS[sourceOf(currentIndex)] ?? ""}
+                            ·{" "}
+                            {sectionLabels[
+                              displayTracks[currentIndex]?.source ?? 0
+                            ] ?? ""}
                           </>
                         )}
                       </p>
@@ -1371,7 +1132,7 @@ export default function MehfilApp() {
       {/* ════════════════════════════════════════════════
           ALWAYS-ON BOTTOM TRANSPORT BAR
           ════════════════════════════════════════════════ */}
-      {showBar && (
+      {isReady && (
         <div className="player-bar">
           <div
             className="player-bar-seek"
@@ -1410,10 +1171,10 @@ export default function MehfilApp() {
                 </p>
                 <p className="text-[0.7rem] text-[color:var(--color-muted)] truncate mt-0.5">
                   {displayArtist}
-                  {videoIds.length > 0 && (
+                  {tracks.length > 0 && (
                     <span className="opacity-60">
                       {" "}
-                      · {currentIndex + 1}/{videoIds.length}
+                      · {currentIndex + 1}/{tracks.length}
                     </span>
                   )}
                 </p>
@@ -1425,7 +1186,7 @@ export default function MehfilApp() {
                 onClick={prev}
                 className="player-bar-btn"
                 aria-label="Previous"
-                disabled={!isReady}
+                disabled={tracks.length === 0}
               >
                 <IconPrev />
               </button>
@@ -1433,7 +1194,7 @@ export default function MehfilApp() {
                 onClick={togglePlay}
                 className="player-bar-btn player-bar-btn-main"
                 aria-label={isPlaying ? "Pause" : "Play"}
-                disabled={!isReady}
+                disabled={!currentId}
               >
                 {isPlaying ? <IconPause size={22} /> : <IconPlay size={22} />}
               </button>
@@ -1441,8 +1202,7 @@ export default function MehfilApp() {
                 onClick={next}
                 className="player-bar-btn"
                 aria-label="Next"
-                aria-disabled={!isReady}
-                disabled={!isReady}
+                disabled={tracks.length === 0}
               >
                 <IconNext />
               </button>
@@ -1457,7 +1217,6 @@ export default function MehfilApp() {
                 onClick={toggleMute}
                 className="player-bar-btn hidden sm:flex"
                 aria-label={isMuted ? "Unmute" : "Mute"}
-                disabled={playerMode !== "api"}
               >
                 {isMuted || volume === 0 ? <IconMute /> : <IconVolume />}
               </button>
