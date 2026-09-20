@@ -17,6 +17,20 @@ const CACHE_TTL_MS = 30 * 60 * 1000;
 let cache: { data: unknown; at: number } | null = null;
 let inflight: Promise<unknown> | null = null;
 
+function fallbackItems(i: number, segLabel: string): PlaylistItem[] {
+  const fb = FALLBACK_SECTIONS[i];
+  if (!fb) return [];
+  return fb.ids.map((id) => ({
+    id,
+    title: "",
+    channel: "",
+    duration: "",
+    thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
+    segmentIndex: i,
+    segmentLabel: segLabel,
+  }));
+}
+
 async function load(): Promise<Record<string, unknown>> {
   const items: PlaylistItem[] = [];
   const sections: { label: string; count: number }[] = [];
@@ -24,35 +38,35 @@ async function load(): Promise<Record<string, unknown>> {
 
   for (let i = 0; i < SEGMENTS.length; i++) {
     const seg = SEGMENTS[i];
-    try {
-      if (seg.type === "playlist") {
-        const got = await fetchPlaylistItems(seg.id, i, seg.label);
-        items.push(...got);
-        sections.push({ label: seg.label, count: got.length });
-      } else {
-        const got = await fetchVideoMetas(seg.ids, i, seg.label);
-        items.push(...got);
-        singles.push(...got);
-        sections.push({ label: seg.label, count: got.length });
+    let got: PlaylistItem[] = [];
+
+    // Try the live source up to twice (a throttled YouTube page returns
+    // HTTP 200 but empty, so an EMPTY result also counts as a failure).
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (seg.type === "playlist") {
+          got = await fetchPlaylistItems(seg.id, i, seg.label);
+        } else {
+          got = await fetchVideoMetas(seg.ids, i, seg.label);
+        }
+        if (got.length > 0) break;
+      } catch {
+        got = [];
       }
-    } catch {
-      // Live scrape failed for this segment — fall back to the baked-in
-      // snapshot so the archive never comes up empty.
-      const fb = FALLBACK_SECTIONS[i];
-      if (fb) {
-        const got: PlaylistItem[] = fb.ids.map((id) => ({
-          id,
-          title: "",
-          channel: "",
-          duration: "",
-          thumbnail: `https://i.ytimg.com/vi/${id}/hqdefault.jpg`,
-          segmentIndex: i,
-          segmentLabel: seg.label,
-        }));
-        items.push(...got);
-        sections.push({ label: seg.label, count: got.length });
+      if (attempt === 0) {
+        await new Promise((r) => setTimeout(r, 800));
       }
     }
+
+    if (got.length === 0) {
+      // Live source unavailable — use the baked-in snapshot so the archive
+      // never comes up empty.
+      got = fallbackItems(i, seg.label);
+    }
+
+    items.push(...got);
+    if (seg.type === "videos") singles.push(...got);
+    sections.push({ label: seg.label, count: got.length });
   }
 
   // ID-based dedupe: drop playlist copies of handpicked singles, keep
