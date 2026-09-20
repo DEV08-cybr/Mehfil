@@ -301,6 +301,7 @@ export default function MehfilApp() {
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const trackItemRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const archiveRef = useRef<HTMLElement | null>(null);
+  const pendingAutoplayRef = useRef(false);
 
   /* ── Derived ────────────────────────────────────────── */
 
@@ -874,19 +875,70 @@ export default function MehfilApp() {
     });
   }, []);
 
-  const enterArchive = useCallback(
-    (startPlaying = false) => {
-      setView("archive");
-      requestAnimationFrame(() => {
-        archiveRef.current?.scrollIntoView({
-          behavior: "smooth",
-          block: "start",
-        });
-      });
-      if (startPlaying && isReady) play();
-    },
-    [isReady, play]
-  );
+  const enterArchive = useCallback((startPlaying = false) => {
+    if (startPlaying) pendingAutoplayRef.current = true;
+    setView("archive");
+    requestAnimationFrame(() => {
+      archiveRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+  }, []);
+
+  /* ── Position the (persistent, fixed) player over the visible
+        Now Playing card in the archive; park it off-canvas on landing.
+        Fixed positioning means React re-renders can never destroy it. ── */
+
+  useEffect(() => {
+    const park = document.getElementById("yt-park");
+    if (!park) return;
+
+    const parkIt = () => {
+      park.style.cssText =
+        "position:fixed;left:0;bottom:0;width:320px;height:180px;opacity:0;pointer-events:none;z-index:-1;overflow:hidden;";
+    };
+
+    if (view !== "archive" || !isReady) {
+      parkIt();
+      return;
+    }
+
+    const slot = document.getElementById("yt-slot");
+    if (!slot) {
+      parkIt();
+      return;
+    }
+
+    const place = () => {
+      const target = document.getElementById("yt-slot");
+      if (!target) return;
+      const r = target.getBoundingClientRect();
+      park.style.cssText = `position:fixed;left:${r.left}px;top:${r.top}px;width:${r.width}px;height:${r.height}px;opacity:1;pointer-events:auto;z-index:5;overflow:hidden;`;
+    };
+
+    // Place after the slot has painted, then optionally start playback
+    const raf = requestAnimationFrame(() => {
+      place();
+      if (pendingAutoplayRef.current && isReady) {
+        pendingAutoplayRef.current = false;
+        window.setTimeout(() => play(), 120);
+      }
+    });
+
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    let ro: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== "undefined") {
+      ro = new ResizeObserver(place);
+      ro.observe(slot);
+    }
+
+    return () => {
+      cancelAnimationFrame(raf);
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+      ro?.disconnect();
+      parkIt();
+    };
+  }, [view, isReady, play, currentId]);
 
   /* ── Keyboard ───────────────────────────────────────── */
 
@@ -927,9 +979,11 @@ export default function MehfilApp() {
 
   return (
     <div className={`mehfil-stage ${showBar ? "has-player-bar" : ""}`}>
-      {/* Hidden YouTube audio engine — rendered at real size so the
-          browser never throttles/autoplay-blocks it, but fully invisible */}
-      <div aria-hidden className="yt-engine-hidden">
+      {/* Parked YouTube player — the live #yt-engine is moved into the
+          visible Now Playing card while in the archive (see reparent
+          effect). Parked off-canvas at a real render size on the landing
+          page so the browser never throttles it. */}
+      <div id="yt-park" aria-hidden className="yt-park">
         <div id="yt-engine" />
       </div>
 
@@ -1266,35 +1320,20 @@ export default function MehfilApp() {
                     </span>
                   </div>
 
-                  <div className="relative aspect-square sm:aspect-[4/3] bg-black/40 overflow-hidden">
-                    {currentId ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={thumbUrl(currentId)}
-                        alt={displayTitle}
-                        className="absolute inset-0 w-full h-full object-cover"
-                      />
-                    ) : (
-                      <div className="absolute inset-0 flex items-center justify-center text-[color:var(--color-muted)]">
+                  <div className="player-video">
+                    {/* The live, visible YouTube frame is positioned over
+                        this slot (see the park/place effect). It carries the
+                        official stream; controls live in the bottom bar. */}
+                    <div id="yt-slot" className="player-video-slot" />
+
+                    {!isReady && (
+                      <div className="absolute inset-0 z-[6] flex flex-col items-center justify-center gap-3 bg-black/70 text-[color:var(--color-muted)]">
                         <div className="w-8 h-8 border border-[color:var(--color-gold)] border-t-transparent rounded-full spin" />
+                        <span className="text-xs tracking-[0.18em] uppercase">
+                          Opening the mehfil…
+                        </span>
                       </div>
                     )}
-                    <div className="absolute inset-0 bg-gradient-to-t from-[rgba(8,6,4,0.85)] via-transparent to-transparent" />
-
-                    <button
-                      onClick={togglePlay}
-                      disabled={!isReady}
-                      className="absolute inset-0 flex items-center justify-center group"
-                      aria-label={isPlaying ? "Pause" : "Play"}
-                    >
-                      <span className="w-16 h-16 rounded-full bg-[color:var(--color-gold)] text-[#1a140c] flex items-center justify-center shadow-xl opacity-90 group-hover:opacity-100 group-hover:scale-105 transition-all">
-                        {isPlaying ? (
-                          <IconPause size={26} />
-                        ) : (
-                          <IconPlay size={26} />
-                        )}
-                      </span>
-                    </button>
                   </div>
 
                   <div className="p-5 sm:p-6">
@@ -1305,8 +1344,8 @@ export default function MehfilApp() {
                       {displayTitle}
                     </h3>
                     <p className="mt-3 text-sm text-[color:var(--color-muted)] leading-relaxed">
-                      Playback runs quietly in the background. Use the bar at
-                      the bottom for play, pause, previous, and next.
+                      The player above carries the official YouTube stream. Use
+                      the bar at the bottom for play, pause, previous, and next.
                     </p>
 
                     <div className="mt-5 flex flex-wrap gap-2.5">
