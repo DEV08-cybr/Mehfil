@@ -1,13 +1,11 @@
-import { db } from "@/db";
-import { sql } from "drizzle-orm";
-
+// Dependency-free health check so the app deploys anywhere
+// (including Vercel) without a DATABASE_URL.
 export const dynamic = "force-dynamic";
 
 export async function GET() {
-  try {
-    await db.execute(sql`select 1`);
-    return Response.json({ ok: true });
-  } catch {
-    return Response.json({ ok: false }, { status: 500 });
-  }
+  return Response.json({
+    ok: true,
+    app: "mehfil-e-qawwali",
+    time: new Date().toISOString(),
+  });
 }

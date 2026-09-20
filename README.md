@@ -41,6 +41,24 @@ npm run build
 npm start
 ```
 
+## Deploy to Vercel (free, ~1 minute)
+
+No environment variables are required.
+
+**Easiest (browser):**
+1. Push this repo to GitHub.
+2. Go to https://vercel.com/new and **Import** the repository.
+3. Vercel auto-detects Next.js — leave every default and click **Deploy**.
+4. You get a public `https://<your-project>.vercel.app` URL. Every future
+   `git push` redeploys automatically.
+
+**Or with the CLI:**
+```bash
+npm i -g vercel
+vercel            # preview deploy
+vercel --prod     # production deploy
+```
+
 ## Editing the music
 
 All sources live in **`src/lib/mehfil.ts`** → `SEGMENTS`.
