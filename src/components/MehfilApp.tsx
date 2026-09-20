@@ -69,6 +69,11 @@ interface YTPlayerInstance {
     index?: number;
     startSeconds?: number;
   }) => void;
+  loadPlaylist: (config: {
+    playlist: string[];
+    index?: number;
+    startSeconds?: number;
+  }) => void;
   destroy: () => void;
 }
 
@@ -287,10 +292,12 @@ export default function MehfilApp() {
   const [searchQuery, setSearchQuery] = useState("");
   const [showFavorites, setShowFavorites] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const playerRef = useRef<YTPlayerInstance | null>(null);
   const playerInitRef = useRef(false);
   const readyRef = useRef(false);
+  const errorStreakRef = useRef(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const trackItemRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const archiveRef = useRef<HTMLElement | null>(null);
@@ -475,21 +482,33 @@ export default function MehfilApp() {
         });
 
         const p = playerRef.current;
-        if (p && combined.length > 0) {
+        // Only swap the player's queue if new tracks were actually added —
+        // re-cueing the same list would stop whatever is playing.
+        if (p && combined.length > firstIds.length) {
           try {
-            const wasPlaying = p.getPlayerState() === 1;
+            const state = p.getPlayerState();
+            const wasPlaying = state === 1 || state === 3; // PLAYING / BUFFERING
             const oldIndex =
               typeof p.getPlaylistIndex() === "number"
                 ? p.getPlaylistIndex()
                 : 0;
             const oldId = firstIds[oldIndex];
-            const newIndex = oldId ? combined.indexOf(oldId) : -1;
-            p.cuePlaylist({
-              playlist: combined,
-              index: newIndex >= 0 ? newIndex : 0,
-              startSeconds: 0,
-            });
-            if (wasPlaying) p.playVideo();
+            const newIndex = oldId ? combined.indexOf(oldId) : 0;
+            const safeIndex = newIndex >= 0 ? newIndex : 0;
+            if (wasPlaying) {
+              // loadPlaylist keeps audio running through the swap
+              p.loadPlaylist({
+                playlist: combined,
+                index: safeIndex,
+                startSeconds: 0,
+              });
+            } else {
+              p.cuePlaylist({
+                playlist: combined,
+                index: safeIndex,
+                startSeconds: 0,
+              });
+            }
             updateTrackInfo();
           } catch {
             /* ignore */
@@ -511,6 +530,19 @@ export default function MehfilApp() {
     if (!p) return;
     readyRef.current = true;
     setIsReady(true);
+
+    // Make sure the generated iframe carries the autoplay feature policy
+    const iframe = document.querySelector<HTMLIFrameElement>(
+      "#yt-engine iframe"
+    );
+    if (iframe) {
+      iframe.setAttribute(
+        "allow",
+        "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+      );
+      iframe.setAttribute("allowfullscreen", "true");
+    }
+
     try {
       setVolume(p.getVolume());
     } catch {
@@ -524,12 +556,33 @@ export default function MehfilApp() {
     void chainSegments(ids ?? []);
   }, [updateTrackInfo, chainSegments]);
 
+  /* A blocked / deleted / private video must not freeze the mehfil —
+     skip it automatically, and only surface a notice after many failures. */
+  const onPlayerError = useCallback(() => {
+    errorStreakRef.current += 1;
+    if (errorStreakRef.current <= 6) {
+      window.setTimeout(() => {
+        try {
+          playerRef.current?.nextVideo();
+        } catch {
+          /* ignore */
+        }
+      }, 300);
+    } else {
+      setNotice(
+        "Playback is restricted in this browser. Tap “Open on YouTube” to listen there."
+      );
+    }
+  }, []);
+
   const onStateChange = useCallback(
     (event: { data: number }) => {
       if (!window.YT) return;
       const S = window.YT.PlayerState;
       switch (event.data) {
         case S.PLAYING:
+          errorStreakRef.current = 0;
+          setNotice(null);
           setIsPlaying(true);
           startTimeUpdate();
           updateTrackInfo();
@@ -565,8 +618,10 @@ export default function MehfilApp() {
           return;
         }
         playerRef.current = new window.YT.Player("yt-engine", {
-          height: "1",
-          width: "1",
+          // Real render size keeps the browser from throttling or
+          // autoplay-blocking the frame; CSS makes it invisible.
+          height: "180",
+          width: "320",
           playerVars: {
             listType: "playlist",
             list: FIRST_PLAYLIST.id,
@@ -574,6 +629,9 @@ export default function MehfilApp() {
             controls: 0,
             modestbranding: 1,
             rel: 0,
+            iv_load_policy: 3,
+            disablekb: 1,
+            fs: 0,
             enablejsapi: 1,
             playsinline: 1,
             origin:
@@ -582,11 +640,7 @@ export default function MehfilApp() {
           events: {
             onReady: onPlayerReady,
             onStateChange: onStateChange,
-            onError: () => {
-              setError(
-                "A track could not be loaded. Try the next piece or open it on YouTube."
-              );
-            },
+            onError: onPlayerError,
           },
         });
       } catch {
@@ -620,7 +674,7 @@ export default function MehfilApp() {
       clearTimeout(timeout);
       stopTimeUpdate();
     };
-  }, [onPlayerReady, onStateChange, stopTimeUpdate]);
+  }, [onPlayerReady, onStateChange, onPlayerError, stopTimeUpdate]);
 
   /* ── Titles ─────────────────────────────────────────── */
 
@@ -669,10 +723,32 @@ export default function MehfilApp() {
   /* ── Controls ───────────────────────────────────────── */
 
   const play = useCallback(() => {
+    const p = playerRef.current;
+    if (!p) return;
     try {
-      playerRef.current?.playVideo();
+      const state = p.getPlayerState();
+      // -1 unstarted, 5 cued → playVideo() alone can stall on a cued list;
+      // playVideoAt forces the current index to load.
+      if (state === -1 || state === 5) {
+        const idx =
+          typeof p.getPlaylistIndex() === "number" && p.getPlaylistIndex() >= 0
+            ? p.getPlaylistIndex()
+            : 0;
+        p.playVideoAt(idx);
+      } else {
+        p.playVideo();
+      }
+      setIsPlaying(true);
     } catch {
-      /* ignore */
+      // Last resort: load the combined queue fresh at the current index
+      try {
+        const ids = playerRef.current?.getPlaylist?.() ?? [];
+        if (ids.length > 0) {
+          p.loadPlaylist({ playlist: ids, index: 0 });
+        }
+      } catch {
+        /* ignore */
+      }
     }
   }, []);
 
@@ -689,15 +765,28 @@ export default function MehfilApp() {
     else play();
   }, [isPlaying, play, pause]);
 
-  const playAt = useCallback((idx: number) => {
-    setCurrentIndex(idx);
-    try {
-      playerRef.current?.playVideoAt(idx);
-      setIsPlaying(true);
-    } catch {
-      /* ignore */
-    }
-  }, []);
+  const playAt = useCallback(
+    (idx: number) => {
+      setCurrentIndex(idx);
+      const p = playerRef.current;
+      if (!p) return;
+      try {
+        p.playVideoAt(idx);
+        setIsPlaying(true);
+      } catch {
+        // Index may be out of range if the merged list isn't loaded yet
+        try {
+          if (videoIds.length > 0) {
+            p.loadPlaylist({ playlist: videoIds, index: idx });
+            setIsPlaying(true);
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    },
+    [videoIds]
+  );
 
   const next = useCallback(() => {
     try {
@@ -838,12 +927,9 @@ export default function MehfilApp() {
 
   return (
     <div className={`mehfil-stage ${showBar ? "has-player-bar" : ""}`}>
-      {/* Hidden YouTube engine — audio only, never shown */}
-      <div
-        aria-hidden
-        className="fixed bottom-0 left-0 overflow-hidden pointer-events-none"
-        style={{ width: 1, height: 1, opacity: 0.01, zIndex: -1 }}
-      >
+      {/* Hidden YouTube audio engine — rendered at real size so the
+          browser never throttles/autoplay-blocks it, but fully invisible */}
+      <div aria-hidden className="yt-engine-hidden">
         <div id="yt-engine" />
       </div>
 
@@ -1272,6 +1358,16 @@ export default function MehfilApp() {
             </div>
           </footer>
         </section>
+      )}
+
+      {/* Playback notice */}
+      {notice && (
+        <div className="player-notice">
+          <span>{notice}</span>
+          <button onClick={() => setNotice(null)} aria-label="Dismiss">
+            ×
+          </button>
+        </div>
       )}
 
       {/* ════════════════════════════════════════════════

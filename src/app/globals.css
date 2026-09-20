@@ -304,6 +304,66 @@ body {
   -webkit-backdrop-filter: blur(20px);
 }
 
+/* ── Hidden audio engine ─────────────────────────────────── */
+
+/* Rendered at a real size (not 1×1 and not display:none) so browsers never
+   throttle or autoplay-block the frame — but fully invisible and silent in
+   appearance. Audio still plays normally. */
+.yt-engine-hidden {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 320px;
+  height: 180px;
+  opacity: 0;
+  pointer-events: none;
+  z-index: -1;
+  overflow: hidden;
+}
+
+.yt-engine-hidden iframe {
+  width: 320px !important;
+  height: 180px !important;
+  border: 0;
+}
+
+/* ── Playback notice toast ───────────────────────────────── */
+
+.player-notice {
+  position: fixed;
+  left: 50%;
+  bottom: 6.2rem;
+  transform: translateX(-50%);
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  max-width: calc(100vw - 2rem);
+  padding: 0.7rem 1rem;
+  background: rgba(20, 14, 8, 0.95);
+  border: 1px solid var(--color-line-strong);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-radius: 2px;
+  font-size: 0.8rem;
+  color: var(--color-cream-dim);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.5);
+}
+
+.player-notice button {
+  background: transparent;
+  border: 0;
+  color: var(--color-muted);
+  font-size: 1.1rem;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 0.2rem;
+}
+
+.player-notice button:hover {
+  color: var(--color-cream);
+}
+
 /* ── Always-on bottom transport bar ──────────────────────── */
 
 .mehfil-stage.has-player-bar {
