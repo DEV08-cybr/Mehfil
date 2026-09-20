@@ -29,7 +29,7 @@ An elegant, atmospheric listening room built with **Next.js (App Router)** and t
 - **YouTube embed / IFrame JS API** (playback, controlled over `postMessage`)
 - **YouTube oEmbed** (titles, keyless)
 - Server-side playlist resolution in Route Handlers
-- Drizzle ORM / PostgreSQL (healthcheck only)
+- No database or environment variables required (healthcheck is dependency-free)
 
 ---
 
@@ -44,7 +44,7 @@ src/
 │  └─ api/
 │     ├─ playlist/route.ts       # Resolves playlist + single-video queue
 │     ├─ playlist-titles/route.ts# Batch keyless oEmbed title lookup
-│     └─ health/route.ts         # DB/health probe
+│     └─ health/route.ts         # Dependency-free health probe
 ├─ components/
 │  └─ MehfilApp.tsx              # Landing + Archive, embed bridge, transport bar
 └─ lib/
