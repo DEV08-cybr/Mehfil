@@ -68,10 +68,21 @@ function parseTitle(raw: string): { title: string; artist: string } {
   return { title: cleaned || raw, artist: "" };
 }
 
+/* The raw YouTube embed (enablejsapi=1) is controlled over postMessage.
+   The frame id must accompany every command and the listening handshake. */
+const PLAYER_FRAME_ID = "mehfil-youtube-frame";
+
 function embedUrl(id: string, autoplay: boolean): string {
-  return `https://www.youtube.com/embed/${id}?enablejsapi=1&autoplay=${
-    autoplay ? 1 : 0
-  }&rel=0&modestbranding=1&playsinline=1`;
+  const origin =
+    typeof window !== "undefined"
+      ? encodeURIComponent(window.location.origin)
+      : "https://vercel.app";
+  return (
+    `https://www.youtube.com/embed/${id}?enablejsapi=1` +
+    `&origin=${origin}&widgetid=${PLAYER_FRAME_ID}` +
+    `&autoplay=${autoplay ? 1 : 0}` +
+    `&rel=0&modestbranding=1&playsinline=1&iv_load_policy=3&fs=0`
+  );
 }
 
 /* ================================================================
@@ -212,6 +223,9 @@ export default function MehfilApp() {
   const tracksRef = useRef<Track[]>([]);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const skipGuardRef = useRef(0);
+  const hasStartedRef = useRef(false);
+  const enterArchiveRef = useRef<(start?: boolean) => void>(() => {});
+  const [mountKey, setMountKey] = useState(0);
   const trackItemRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const archiveRef = useRef<HTMLElement | null>(null);
 
@@ -453,9 +467,45 @@ export default function MehfilApp() {
     if (!win) return;
     try {
       win.postMessage(
-        JSON.stringify({ event: "command", func, args }),
+        JSON.stringify({
+          event: "command",
+          func,
+          args,
+          id: PLAYER_FRAME_ID,
+          channel: "widget",
+        }),
         "https://www.youtube.com"
       );
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  /* A raw enablejsapi embed must be told we're listening before it will
+     accept commands or stream infoDelivery updates. Send on every load. */
+  const handshake = useCallback(() => {
+    const win = iframeRef.current?.contentWindow;
+    if (!win) return;
+    try {
+      win.postMessage(
+        JSON.stringify({
+          event: "listening",
+          id: PLAYER_FRAME_ID,
+          channel: "widget",
+        }),
+        "https://www.youtube.com"
+      );
+      // Some builds need a second nudge shortly after load
+      window.setTimeout(() => {
+        iframeRef.current?.contentWindow?.postMessage(
+          JSON.stringify({
+            event: "listening",
+            id: PLAYER_FRAME_ID,
+            channel: "widget",
+          }),
+          "https://www.youtube.com"
+        );
+      }, 250);
     } catch {
       /* ignore */
     }
@@ -478,20 +528,30 @@ export default function MehfilApp() {
 
   /* ── Track switching (iframe remount = new video) ───── */
 
-  const playAt = useCallback((idx: number) => {
+  /* Force a brand-new iframe load with autoplay=1. Because this mount is
+     triggered by a user gesture (click / key), the browser allows the
+     video to start with sound — the single most reliable way to start. */
+  const startFresh = useCallback((idx?: number) => {
     const list = tracksRef.current;
     if (list.length === 0) return;
-    const clamped = ((idx % list.length) + list.length) % list.length;
+    const target =
+      typeof idx === "number"
+        ? ((idx % list.length) + list.length) % list.length
+        : currentIndexRef.current;
     skipGuardRef.current = 0;
     setCurrentTime(0);
     setDuration(0);
-    setCurrentIndex(clamped);
-    if (clamped === currentIndexRef.current) {
-      sendCmd("playVideo");
-    }
-    // A changed index remounts the iframe with autoplay=1
+    setCurrentIndex(target);
     setIsPlaying(true);
-  }, [sendCmd]);
+    setMountKey((k) => k + 1); // remount → autoplay=1
+  }, []);
+
+  const playAt = useCallback(
+    (idx: number) => {
+      startFresh(idx);
+    },
+    [startFresh]
+  );
 
   const advance = useCallback(() => {
     const list = tracksRef.current;
@@ -510,55 +570,73 @@ export default function MehfilApp() {
     const onMsg = (e: MessageEvent) => {
       if (!YT_ORIGINS.has(e.origin)) return;
       if (typeof e.data !== "string") return;
-      let data: { event?: string; info?: number | string };
+      let data: {
+        event?: string;
+        id?: string;
+        info?: {
+          playerState?: number;
+          currentTime?: number;
+          duration?: number;
+          playerError?: number;
+        };
+      };
       try {
         data = JSON.parse(e.data);
       } catch {
         return;
       }
-      switch (data.event) {
-        case "onReady":
-          setIsReady(true);
+
+      // initialDelivery is the raw-embed equivalent of onReady
+      if (data.event === "initialDelivery" || data.event === "onReady") {
+        setIsReady(true);
+        skipGuardRef.current = 0;
+        sendCmd("getDuration");
+        sendCmd("getCurrentTime");
+        sendCmd("addEventListener"); // no-op safety; state still streams
+        startPolling();
+        return;
+      }
+
+      if (data.event !== "infoDelivery" || !data.info) return;
+      const info = data.info;
+
+      if (typeof info.playerState === "number") {
+        const s = info.playerState;
+        if (s === 1) {
+          // playing
+          hasStartedRef.current = true;
+          skipGuardRef.current = 0;
+          setIsPlaying(true);
+          startPolling();
           sendCmd("getDuration");
-          break;
-        case "onStateChange": {
-          const s = Number(data.info);
-          if (s === 1) {
-            // playing
-            skipGuardRef.current = 0;
-            setIsPlaying(true);
-            startPolling();
-          } else if (s === 2) {
-            // paused
-            setIsPlaying(false);
-            stopPolling();
-          } else if (s === 0) {
-            // ended → next piece
-            setIsPlaying(false);
-            stopPolling();
-            advance();
-          }
-          break;
+        } else if (s === 2) {
+          // paused
+          setIsPlaying(false);
+        } else if (s === 0) {
+          // ended → next piece
+          setIsPlaying(false);
+          stopPolling();
+          advance();
         }
-        case "onCurrentTime":
-          setCurrentTime(Number(data.info) || 0);
-          break;
-        case "onDurationChange":
-          setDuration(Number(data.info) || 0);
-          break;
-        case "onError": {
-          const code = Number(data.info);
-          // 2 invalid param, 5 html5, 100 not found, 101/150 embed blocked
-          if (code === 101 || code === 150 || code === 100) {
-            skipGuardRef.current += 1;
-            if (skipGuardRef.current > 6) {
-              setIsPlaying(false);
-              stopPolling();
-              break;
-            }
-            advance();
+      }
+
+      if (typeof info.currentTime === "number") {
+        setCurrentTime(info.currentTime);
+      }
+      if (typeof info.duration === "number" && info.duration > 0) {
+        setDuration(info.duration);
+      }
+      if (typeof info.playerError === "number") {
+        const code = info.playerError;
+        // 2 invalid param, 5 html5, 100 not found, 101/150 embed blocked
+        if (code === 100 || code === 101 || code === 150 || code === 2) {
+          skipGuardRef.current += 1;
+          if (skipGuardRef.current <= 6) {
+            window.setTimeout(() => advance(), 250);
+          } else {
+            setIsPlaying(false);
+            stopPolling();
           }
-          break;
         }
       }
     };
@@ -581,7 +659,13 @@ export default function MehfilApp() {
 
   const play = useCallback(() => {
     if (!currentId) return;
-    sendCmd("playVideo");
+    if (hasStartedRef.current && iframeRef.current) {
+      // Already loaded once — resume in place (keeps position)
+      sendCmd("playVideo");
+    } else {
+      // First start: fresh autoplay mount within the click gesture
+      setMountKey((k) => k + 1);
+    }
     setIsPlaying(true);
   }, [currentId, sendCmd]);
 
@@ -591,9 +675,15 @@ export default function MehfilApp() {
   }, [sendCmd]);
 
   const togglePlay = useCallback(() => {
-    if (isPlaying) pause();
-    else play();
-  }, [isPlaying, play, pause]);
+    if (isPlaying) {
+      pause();
+    } else if (view === "landing") {
+      enterArchiveRef.current?.(true);
+    } else {
+      play();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isPlaying, pause, play]);
 
   const next = useCallback(() => {
     if (tracks.length === 0) return;
@@ -666,10 +756,16 @@ export default function MehfilApp() {
           block: "start",
         });
       });
-      if (startPlaying) play();
+      if (startPlaying) {
+        if (hasStartedRef.current) play();
+        else setMountKey((k) => k + 1);
+        setIsPlaying(true);
+      }
     },
     [play]
   );
+
+  enterArchiveRef.current = enterArchive;
 
   /* ── Keyboard ──────────────────────────────────────── */
 
@@ -710,7 +806,7 @@ export default function MehfilApp() {
     sections.length > 0 ? sections.map((s) => s.label) : SEGMENT_LABELS;
 
   return (
-    <div className={`mehfil-stage ${isReady ? "has-player-bar" : ""}`}>
+    <div className="mehfil-stage has-player-bar">
       {/* ════════════════════════════════════════════════
           LANDING
           ════════════════════════════════════════════════ */}
@@ -1045,10 +1141,12 @@ export default function MehfilApp() {
                   <div className="player-slot">
                     {currentId ? (
                       <iframe
-                        key={`${currentId}-${currentIndex}`}
+                        key={`${currentId}-${currentIndex}-${mountKey}`}
+                        id={PLAYER_FRAME_ID}
                         ref={iframeRef}
-                        src={embedUrl(currentId, true)}
+                        src={embedUrl(currentId, mountKey > 0)}
                         title={displayTitle}
+                        onLoad={handshake}
                         allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
                         allowFullScreen
                       />
@@ -1134,9 +1232,9 @@ export default function MehfilApp() {
 
       {/* ════════════════════════════════════════════════
           ALWAYS-ON BOTTOM TRANSPORT BAR
+          (always rendered; buttons enable once the queue/frame is ready)
           ════════════════════════════════════════════════ */}
-      {isReady && (
-        <div className="player-bar">
+      <div className="player-bar">
           <div
             className="player-bar-seek"
             onClick={handleSeek}
@@ -1251,7 +1349,6 @@ export default function MehfilApp() {
             </div>
           </div>
         </div>
-      )}
     </div>
   );
 }
