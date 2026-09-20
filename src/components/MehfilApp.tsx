@@ -214,7 +214,6 @@ export default function MehfilApp() {
   const skipGuardRef = useRef(0);
   const trackItemRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const archiveRef = useRef<HTMLElement | null>(null);
-  const pendingAutoplayRef = useRef(false);
 
   currentIndexRef.current = currentIndex;
   tracksRef.current = tracks;
@@ -1132,16 +1131,6 @@ export default function MehfilApp() {
             </div>
           </footer>
         </section>
-
-      {/* Playback notice */}
-      {notice && (
-        <div className="player-notice">
-          <span>{notice}</span>
-          <button onClick={() => setNotice(null)} aria-label="Dismiss">
-            ×
-          </button>
-        </div>
-      )}
 
       {/* ════════════════════════════════════════════════
           ALWAYS-ON BOTTOM TRANSPORT BAR
