@@ -83,7 +83,12 @@ function formatTime(sec: number): string {
   return `${m}:${s.toString().padStart(2, "0")}`;
 }
 
-function capturePlaylistIds(listId: string): Promise<string[]> {
+/**
+ * Captures a playlist's video IDs with a TEMPORARY player.
+ * Uses a real-sized (320x180) offscreen holder — a 1x1 player does not
+ * reliably initialize in browsers, so real dimensions matter.
+ */
+function capturePlaylistIds(listId: string, timeoutMs = 8000): Promise<string[]> {
   return new Promise((resolve) => {
     let settled = false;
     let temp: YTPlayerInstance | null = null;
@@ -91,7 +96,7 @@ function capturePlaylistIds(listId: string): Promise<string[]> {
     const holder = document.createElement("div");
     holder.setAttribute("aria-hidden", "true");
     holder.style.cssText =
-      "position:fixed;bottom:0;left:0;width:1px;height:1px;opacity:0.01;overflow:hidden;pointer-events:none;";
+      "position:fixed;top:-2000px;left:0;width:320px;height:180px;visibility:hidden;pointer-events:none;";
     document.body.appendChild(holder);
 
     const finish = (ids: string[]) => {
@@ -107,12 +112,12 @@ function capturePlaylistIds(listId: string): Promise<string[]> {
       resolve(ids);
     };
 
-    const timer = setTimeout(() => finish([]), 25_000);
+    const timer = setTimeout(() => finish([]), timeoutMs);
 
     try {
       temp = new window.YT.Player(holder, {
-        width: 1,
-        height: 1,
+        width: 320,
+        height: 180,
         playerVars: {
           listType: "playlist",
           list: listId,
@@ -276,6 +281,7 @@ export default function MehfilApp() {
   const [duration, setDuration] = useState(0);
   const [volume, setVolume] = useState(80);
   const [isMuted, setIsMuted] = useState(false);
+  const [playerMode, setPlayerMode] = useState<"api" | "embed">("api");
 
   const [videoIds, setVideoIds] = useState<string[]>([]);
   const [boundaries, setBoundaries] = useState<number[]>([0]);
@@ -291,9 +297,14 @@ export default function MehfilApp() {
   const playerRef = useRef<YTPlayerInstance | null>(null);
   const playerInitRef = useRef(false);
   const readyRef = useRef(false);
+  const modeRef = useRef<"api" | "embed">("api");
+  const skipGuardRef = useRef(0);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const trackItemRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const archiveRef = useRef<HTMLElement | null>(null);
+  const embedIframeRef = useRef<HTMLIFrameElement | null>(null);
+
+  modeRef.current = playerMode;
 
   /* ── Derived ────────────────────────────────────────── */
 
@@ -394,7 +405,7 @@ export default function MehfilApp() {
     if (intervalRef.current) clearInterval(intervalRef.current);
     intervalRef.current = setInterval(() => {
       const p = playerRef.current;
-      if (!p) return;
+      if (!p || modeRef.current !== "api") return;
       try {
         setCurrentTime(p.getCurrentTime());
         setDuration(p.getDuration());
@@ -411,21 +422,38 @@ export default function MehfilApp() {
     }
   }, []);
 
+  /* ── Mode switching ─────────────────────────────────── */
+
+  const switchToEmbed = useCallback(() => {
+    setPlayerMode("embed");
+    setIsReady(true);
+    const singles = SEGMENTS.flatMap((s) =>
+      s.type === "videos" ? s.ids : []
+    );
+    setVideoIds((prev) => (prev.length > 0 ? prev : singles));
+  }, []);
+
   /* ── Player callbacks ───────────────────────────────── */
 
   const updateTrackInfo = useCallback(() => {
     const p = playerRef.current;
-    if (!p) return;
+    if (!p || modeRef.current !== "api") return;
     try {
       const data = p.getVideoData();
       const idx = p.getPlaylistIndex();
-      if (typeof idx === "number" && idx >= 0) setCurrentIndex(idx);
+      if (typeof idx === "number" && idx >= 0) {
+        setCurrentIndex(idx);
+        skipGuardRef.current = 0;
+      }
       if (data.title) {
         const parsed = parseTitle(data.title);
         setCurrentTitle(parsed.title);
         setCurrentArtist(parsed.artist || data.author || "");
         if (data.video_id) {
-          setTrackTitles((prev) => ({ ...prev, [data.video_id]: data.title }));
+          setTrackTitles((prev) => ({
+            ...prev,
+            [data.video_id]: data.title,
+          }));
         }
       } else if (data.author) {
         setCurrentArtist(data.author);
@@ -510,6 +538,7 @@ export default function MehfilApp() {
     const p = playerRef.current;
     if (!p) return;
     readyRef.current = true;
+    setPlayerMode("api");
     setIsReady(true);
     try {
       setVolume(p.getVolume());
@@ -531,6 +560,7 @@ export default function MehfilApp() {
       switch (event.data) {
         case S.PLAYING:
           setIsPlaying(true);
+          skipGuardRef.current = 0;
           startTimeUpdate();
           updateTrackInfo();
           break;
@@ -551,7 +581,23 @@ export default function MehfilApp() {
     [updateTrackInfo, startTimeUpdate, stopTimeUpdate]
   );
 
-  /* ── Initialize hidden player ───────────────────────── */
+  /* Skip an unplayable/embed-blocked video (with a safety cap) */
+  const onPlayerError = useCallback(() => {
+    skipGuardRef.current += 1;
+    if (skipGuardRef.current > 6) {
+      setError(
+        "Several videos in this playlist block embedding. Use “Open on YouTube” on the card to listen there, or skip ahead with Next."
+      );
+      return;
+    }
+    try {
+      playerRef.current?.nextVideo();
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  /* ── Initialize the real player ─────────────────────── */
 
   useEffect(() => {
     if (playerInitRef.current) return;
@@ -559,14 +605,15 @@ export default function MehfilApp() {
 
     const init = () => {
       try {
-        const target = document.getElementById("yt-engine");
+        const target = document.getElementById("yt-player-target");
         if (!target) {
-          setError("Player engine missing.");
+          switchToEmbed();
+          setError("Player mount missing — switched to standard embed.");
           return;
         }
-        playerRef.current = new window.YT.Player("yt-engine", {
-          height: "1",
-          width: "1",
+        playerRef.current = new window.YT.Player("yt-player-target", {
+          width: "100%",
+          height: "100%",
           playerVars: {
             listType: "playlist",
             list: FIRST_PLAYLIST.id,
@@ -576,21 +623,16 @@ export default function MehfilApp() {
             rel: 0,
             enablejsapi: 1,
             playsinline: 1,
-            origin:
-              typeof window !== "undefined" ? window.location.origin : "",
           },
           events: {
             onReady: onPlayerReady,
             onStateChange: onStateChange,
-            onError: () => {
-              setError(
-                "A track could not be loaded. Try the next piece or open it on YouTube."
-              );
-            },
+            onError: onPlayerError,
           },
         });
       } catch {
-        setError("Could not start the listening engine. Please refresh.");
+        switchToEmbed();
+        setError("Could not start the player — switched to standard embed.");
       }
     };
 
@@ -599,10 +641,7 @@ export default function MehfilApp() {
     } else {
       const tag = document.createElement("script");
       tag.src = "https://www.youtube.com/iframe_api";
-      tag.onerror = () =>
-        setError(
-          "Could not reach YouTube. Check your connection and refresh."
-        );
+      tag.onerror = () => switchToEmbed();
       const first = document.getElementsByTagName("script")[0];
       first.parentNode?.insertBefore(tag, first);
       window.onYouTubeIframeAPIReady = init;
@@ -610,19 +649,25 @@ export default function MehfilApp() {
 
     const timeout = setTimeout(() => {
       if (!readyRef.current) {
-        setError(
-          "The mehfil is taking too long to open. Please refresh the page."
-        );
+        // JS API failed to start in this browser/network — fall back to
+        // a plain YouTube embed, which always works.
+        switchToEmbed();
       }
-    }, 25_000);
+    }, 20_000);
 
     return () => {
       clearTimeout(timeout);
       stopTimeUpdate();
     };
-  }, [onPlayerReady, onStateChange, stopTimeUpdate]);
+  }, [
+    onPlayerReady,
+    onStateChange,
+    onPlayerError,
+    switchToEmbed,
+    stopTimeUpdate,
+  ]);
 
-  /* ── Titles ─────────────────────────────────────────── */
+  /* ── Titles ────────────────────────────────────────── */
 
   useEffect(() => {
     if (videoIds.length === 0) return;
@@ -666,61 +711,102 @@ export default function MehfilApp() {
     if (el) el.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [currentIndex, view]);
 
+  /* ── Embed-mode postMessage controls ────────────────── */
+
+  const embedCommand = useCallback((func: string, args?: unknown[]) => {
+    const win = embedIframeRef.current?.contentWindow;
+    if (!win) return;
+    try {
+      win.postMessage(
+        JSON.stringify({ event: "command", func, args: args ?? [] }),
+        "https://www.youtube.com"
+      );
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   /* ── Controls ───────────────────────────────────────── */
 
   const play = useCallback(() => {
-    try {
-      playerRef.current?.playVideo();
-    } catch {
-      /* ignore */
+    if (modeRef.current === "api") {
+      try {
+        playerRef.current?.playVideo();
+      } catch {
+        /* ignore */
+      }
+    } else if (currentId) {
+      embedCommand("playVideo");
     }
-  }, []);
+    setIsPlaying(true);
+  }, [currentId, embedCommand]);
 
   const pause = useCallback(() => {
-    try {
-      playerRef.current?.pauseVideo();
-    } catch {
-      /* ignore */
+    if (modeRef.current === "api") {
+      try {
+        playerRef.current?.pauseVideo();
+      } catch {
+        /* ignore */
+      }
+    } else {
+      embedCommand("pauseVideo");
     }
-  }, []);
+    setIsPlaying(false);
+  }, [embedCommand]);
 
   const togglePlay = useCallback(() => {
     if (isPlaying) pause();
     else play();
   }, [isPlaying, play, pause]);
 
-  const playAt = useCallback((idx: number) => {
-    setCurrentIndex(idx);
-    try {
-      playerRef.current?.playVideoAt(idx);
+  const playAt = useCallback(
+    (idx: number) => {
+      setCurrentIndex(idx);
+      skipGuardRef.current = 0;
+      if (modeRef.current === "api") {
+        try {
+          playerRef.current?.playVideoAt(idx);
+        } catch {
+          /* ignore */
+        }
+      }
+      // Embed mode: the iframe src is keyed by currentIndex, so the new
+      // video loads with autoplay=1 automatically.
       setIsPlaying(true);
-    } catch {
-      /* ignore */
-    }
-  }, []);
+    },
+    []
+  );
 
   const next = useCallback(() => {
-    try {
-      playerRef.current?.nextVideo();
-    } catch {
-      if (videoIds.length === 0) return;
-      playAt((currentIndex + 1) % videoIds.length);
+    if (modeRef.current === "api" && videoIds.length > 0) {
+      try {
+        playerRef.current?.nextVideo();
+        return;
+      } catch {
+        /* fall through */
+      }
     }
+    if (videoIds.length === 0) return;
+    playAt((currentIndex + 1) % videoIds.length);
   }, [videoIds.length, currentIndex, playAt]);
 
   const prev = useCallback(() => {
-    try {
-      playerRef.current?.previousVideo();
-    } catch {
-      if (videoIds.length === 0) return;
-      playAt((currentIndex - 1 + videoIds.length) % videoIds.length);
+    if (modeRef.current === "api" && videoIds.length > 0) {
+      try {
+        playerRef.current?.previousVideo();
+        return;
+      } catch {
+        /* fall through */
+      }
     }
+    if (videoIds.length === 0) return;
+    playAt((currentIndex - 1 + videoIds.length) % videoIds.length);
   }, [videoIds.length, currentIndex, playAt]);
 
   const handleSeek = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       const p = playerRef.current;
-      if (!p || !duration) return;
+      if (!p || !duration || modeRef.current !== "api") return;
       const rect = e.currentTarget.getBoundingClientRect();
       const pct = Math.max(
         0,
@@ -739,7 +825,7 @@ export default function MehfilApp() {
   const handleVolume = useCallback(
     (e: React.MouseEvent<HTMLDivElement>) => {
       const p = playerRef.current;
-      if (!p) return;
+      if (!p || modeRef.current !== "api") return;
       const rect = e.currentTarget.getBoundingClientRect();
       const pct = Math.max(
         0,
@@ -762,7 +848,7 @@ export default function MehfilApp() {
 
   const toggleMute = useCallback(() => {
     const p = playerRef.current;
-    if (!p) return;
+    if (!p || modeRef.current !== "api") return;
     try {
       if (isMuted) {
         p.unMute();
@@ -799,7 +885,7 @@ export default function MehfilApp() {
     [isReady, play]
   );
 
-  /* ── Keyboard ───────────────────────────────────────── */
+  /* ── Keyboard ──────────────────────────────────────── */
 
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
@@ -838,15 +924,6 @@ export default function MehfilApp() {
 
   return (
     <div className={`mehfil-stage ${showBar ? "has-player-bar" : ""}`}>
-      {/* Hidden YouTube engine — audio only, never shown */}
-      <div
-        aria-hidden
-        className="fixed bottom-0 left-0 overflow-hidden pointer-events-none"
-        style={{ width: 1, height: 1, opacity: 0.01, zIndex: -1 }}
-      >
-        <div id="yt-engine" />
-      </div>
-
       {/* ════════════════════════════════════════════════
           LANDING
           ════════════════════════════════════════════════ */}
@@ -952,8 +1029,17 @@ export default function MehfilApp() {
       {/* ════════════════════════════════════════════════
           ARCHIVE
           ════════════════════════════════════════════════ */}
-      {view === "archive" && (
-        <section ref={archiveRef} className="min-h-screen flex flex-col">
+      {/* The archive (and its player) is ALWAYS mounted. On the landing
+          page it is parked offscreen at full real dimensions so the
+          player engine never unmounts or degrades to a 1x1 box. */}
+      <section
+        ref={archiveRef}
+        className={
+          view === "archive"
+            ? "min-h-screen flex flex-col"
+            : "min-h-screen flex flex-col archive-hidden"
+        }
+      >
           <header className="sticky top-0 z-40 border-b border-[color:var(--color-line)] bg-[rgba(7,6,5,0.72)] backdrop-blur-xl">
             <div className="max-w-7xl mx-auto px-5 sm:px-8 h-14 flex items-center justify-between gap-4">
               <button
@@ -995,8 +1081,8 @@ export default function MehfilApp() {
                 Qawwali, <em className="gold">kept close.</em>
               </h2>
               <p className="mt-4 text-[color:var(--color-cream-dim)] leading-relaxed">
-                A hand-curated listening shelf. Press play from the bar below —
-                no YouTube chrome, just the mehfil.
+                A hand-curated listening shelf. Every piece plays right here —
+                the transport bar at the bottom controls everything.
               </p>
             </div>
 
@@ -1022,7 +1108,7 @@ export default function MehfilApp() {
                   )}
 
                   {error && (
-                    <div className="py-16 px-6 text-center">
+                    <div className="py-12 px-6 text-center">
                       <p className="text-sm text-[color:var(--color-cream-dim)] mb-4">
                         {error}
                       </p>
@@ -1053,8 +1139,7 @@ export default function MehfilApp() {
 
                   {filteredTracks.map((track, pos) => {
                     const isActive = track.index === currentIndex;
-                    const prevTrack =
-                      pos > 0 ? filteredTracks[pos - 1] : null;
+                    const prevTrack = pos > 0 ? filteredTracks[pos - 1] : null;
                     const startsNew =
                       boundaries.length > 1 &&
                       (prevTrack === null ||
@@ -1163,7 +1248,7 @@ export default function MehfilApp() {
                 </div>
               </div>
 
-              {/* Now playing art card — no iframe */}
+              {/* Now playing — real visible player */}
               <aside className="lg:sticky lg:top-20">
                 <div className="player-card overflow-hidden">
                   <div className="flex items-center justify-between px-4 py-3 border-b border-[color:var(--color-line)]">
@@ -1176,40 +1261,45 @@ export default function MehfilApp() {
                       Now in the mehfil
                     </span>
                     <span className="text-[0.68rem] tracking-[0.18em] uppercase text-[color:var(--color-muted)]">
-                      {isReady ? (isPlaying ? "Playing" : "Ready") : "Loading"}
+                      {isReady
+                        ? isPlaying
+                          ? "Playing"
+                          : "Ready"
+                        : "Loading"}
+                      {playerMode === "embed" && (
+                        <span className="ml-2 opacity-60">· embed</span>
+                      )}
                     </span>
                   </div>
 
-                  <div className="relative aspect-square sm:aspect-[4/3] bg-black/40 overflow-hidden">
-                    {currentId ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={thumbUrl(currentId)}
-                        alt={displayTitle}
-                        className="absolute inset-0 w-full h-full object-cover"
-                      />
-                    ) : (
-                      <div className="absolute inset-0 flex items-center justify-center text-[color:var(--color-muted)]">
-                        <div className="w-8 h-8 border border-[color:var(--color-gold)] border-t-transparent rounded-full spin" />
-                      </div>
-                    )}
-                    <div className="absolute inset-0 bg-gradient-to-t from-[rgba(8,6,4,0.85)] via-transparent to-transparent" />
-
-                    <button
-                      onClick={togglePlay}
-                      disabled={!isReady}
-                      className="absolute inset-0 flex items-center justify-center group"
-                      aria-label={isPlaying ? "Pause" : "Play"}
-                    >
-                      <span className="w-16 h-16 rounded-full bg-[color:var(--color-gold)] text-[#1a140c] flex items-center justify-center shadow-xl opacity-90 group-hover:opacity-100 group-hover:scale-105 transition-all">
-                        {isPlaying ? (
-                          <IconPause size={26} />
-                        ) : (
-                          <IconPlay size={26} />
-                        )}
-                      </span>
-                    </button>
-                  </div>
+                  {/* The real player. In API mode the JS API replaces
+                      #yt-player-target with a live 16:9 YouTube iframe.
+                      It is ALWAYS mounted (even on the landing page,
+                      parked offscreen at full size) so playback never
+                      loses its engine. */}
+                  {playerMode === "api" ? (
+                    <div className="player-slot">
+                      <div id="yt-player-target" className="w-full h-full" />
+                    </div>
+                  ) : (
+                    <div className="player-slot">
+                      {currentId ? (
+                        <iframe
+                          key={`${currentId}-${currentIndex}`}
+                          ref={embedIframeRef}
+                          className="player-slot-iframe"
+                          src={`https://www.youtube.com/embed/${currentId}?autoplay=${isPlaying ? 1 : 0}&rel=0&modestbranding=1&playsinline=1`}
+                          title={displayTitle}
+                          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                          allowFullScreen
+                        />
+                      ) : (
+                        <div className="w-full h-full flex items-center justify-center text-[color:var(--color-muted)]">
+                          <div className="w-8 h-8 border border-[color:var(--color-gold)] border-t-transparent rounded-full spin" />
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   <div className="p-5 sm:p-6">
                     <p className="text-[0.68rem] tracking-[0.2em] uppercase text-[color:var(--color-gold)] mb-2">
@@ -1219,11 +1309,20 @@ export default function MehfilApp() {
                       {displayTitle}
                     </h3>
                     <p className="mt-3 text-sm text-[color:var(--color-muted)] leading-relaxed">
-                      Playback runs quietly in the background. Use the bar at
-                      the bottom for play, pause, previous, and next.
+                      Playback runs here with no ads cluttering the room. Use
+                      the bar at the bottom for play, pause, previous and
+                      next.
                     </p>
 
                     <div className="mt-5 flex flex-wrap gap-2.5">
+                      <button className="btn btn-gold" onClick={togglePlay}>
+                        {isPlaying ? (
+                          <IconPause size={15} />
+                        ) : (
+                          <IconPlay size={15} />
+                        )}
+                        {isPlaying ? "Pause" : "Play"}
+                      </button>
                       {currentId && (
                         <a
                           href={youtubeWatchUrl(currentId)}
@@ -1235,9 +1334,6 @@ export default function MehfilApp() {
                           Open on YouTube
                         </a>
                       )}
-                      <button className="btn btn-ghost" onClick={next}>
-                        Next piece
-                      </button>
                     </div>
 
                     {videoIds.length > 0 && (
@@ -1266,20 +1362,17 @@ export default function MehfilApp() {
                 </p>
               </div>
               <p className="text-[0.7rem] text-[color:var(--color-muted-dim)] max-w-sm sm:text-right">
-                Portrait inspired by the classical image of Ustad Nusrat Fateh
-                Ali Khan.
+                Portrait: Ustad Nusrat Fateh Ali Khan. Playback via YouTube.
               </p>
             </div>
           </footer>
         </section>
-      )}
 
       {/* ════════════════════════════════════════════════
           ALWAYS-ON BOTTOM TRANSPORT BAR
           ════════════════════════════════════════════════ */}
       {showBar && (
         <div className="player-bar">
-          {/* Seek */}
           <div
             className="player-bar-seek"
             onClick={handleSeek}
@@ -1300,7 +1393,6 @@ export default function MehfilApp() {
           </div>
 
           <div className="player-bar-inner">
-            {/* Now playing mini */}
             <div className="player-bar-meta min-w-0">
               <div className="w-11 h-11 rounded-[2px] overflow-hidden bg-black/40 shrink-0 hidden sm:block">
                 {currentId ? (
@@ -1328,7 +1420,6 @@ export default function MehfilApp() {
               </div>
             </div>
 
-            {/* Transport */}
             <div className="player-bar-controls">
               <button
                 onClick={prev}
@@ -1350,13 +1441,13 @@ export default function MehfilApp() {
                 onClick={next}
                 className="player-bar-btn"
                 aria-label="Next"
+                aria-disabled={!isReady}
                 disabled={!isReady}
               >
                 <IconNext />
               </button>
             </div>
 
-            {/* Time + volume */}
             <div className="player-bar-side">
               <span className="text-[0.7rem] tabular-nums text-[color:var(--color-muted)] hidden md:inline">
                 {formatTime(currentTime)} / {formatTime(duration)}
@@ -1366,6 +1457,7 @@ export default function MehfilApp() {
                 onClick={toggleMute}
                 className="player-bar-btn hidden sm:flex"
                 aria-label={isMuted ? "Unmute" : "Mute"}
+                disabled={playerMode !== "api"}
               >
                 {isMuted || volume === 0 ? <IconMute /> : <IconVolume />}
               </button>

@@ -304,6 +304,34 @@ body {
   -webkit-backdrop-filter: blur(20px);
 }
 
+/* ── Player slot (the real, visible 16:9 player) ──────────── */
+
+.player-slot {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: #000;
+  overflow: hidden;
+}
+
+.player-slot iframe {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+}
+
+/* Landing page: keep the whole archive (and its live player) mounted
+   but parked offscreen at FULL real dimensions — never a 1x1 box,
+   which is what breaks YouTube players in some browsers. */
+.archive-hidden {
+  position: fixed;
+  left: -10000px;
+  top: 0;
+  width: 100vw;
+  pointer-events: none;
+}
+
 /* ── Always-on bottom transport bar ──────────────────────── */
 
 .mehfil-stage.has-player-bar {
