@@ -41,7 +41,7 @@ body {
 }
 
 body {
-  background: #10151b;
+  background: #080a0b;
   color: var(--cream);
   font-family: var(--font-ui);
   -webkit-font-smoothing: antialiased;
@@ -101,7 +101,7 @@ a {
   position: fixed;
   inset: 0;
   z-index: 0;
-  background: url("/images/mehfil-bg.jpg") center / cover no-repeat;
+  background: url("/images/mehfil-bg.jpg") center center / cover no-repeat;
 }
 
 .bg-veil {
@@ -113,7 +113,7 @@ a {
     radial-gradient(ellipse 70% 55% at 22% 18%, rgba(120, 142, 168, 0.16), transparent 62%),
     radial-gradient(ellipse 65% 50% at 82% 72%, rgba(96, 116, 140, 0.13), transparent 58%),
     radial-gradient(ellipse 90% 70% at 50% 110%, rgba(140, 158, 180, 0.14), transparent 62%),
-    linear-gradient(180deg, rgba(12, 16, 22, 0.62), rgba(14, 19, 26, 0.5) 35%, rgba(10, 14, 19, 0.68));
+    linear-gradient(180deg, rgba(5, 7, 8, 0.48), rgba(8, 11, 13, 0.42) 35%, rgba(5, 7, 8, 0.58));
 }
 
 /* ── Glass ───────────────────────────────────────────────── */
@@ -205,7 +205,7 @@ a {
 .search-wrap {
   position: relative;
   width: 100%;
-  max-width: 480px;
+  max-width: 600px;
   margin: 0 auto;
 }
 
@@ -213,7 +213,7 @@ a {
   display: flex;
   align-items: center;
   gap: 10px;
-  height: 40px;
+  height: 42px;
   padding: 0 4px 0 13px;
   border-radius: 999px;
   background:
@@ -390,20 +390,20 @@ kbd {
   background: var(--glass-border);
 }
 
-/* ── Stage (3 columns, center left empty for the sign) ───── */
-
+/* ── Stage ─────────────────────────────────────────────── */
 .stage {
   position: relative;
   z-index: 10;
   display: grid;
-  grid-template-columns: minmax(300px, 370px) minmax(0, 1fr) minmax(330px, 400px);
-  gap: var(--gap);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 20px;
   height: 100dvh;
   padding: calc(var(--nav-h) + 6px) 14px calc(var(--bar-h) + 6px);
 }
 
+/* The reference design uses the photograph as the visual center. */
 .stage-center {
-  pointer-events: none;
+  display: none;
 }
 
 .panel {
